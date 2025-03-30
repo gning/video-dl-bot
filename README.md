@@ -1,37 +1,60 @@
 # video-dl-bot
 
-A Telegram Bot that can download videos from Twitter(X), YouTube, etc from given URLs. For each URL, the tracing parameters will be removed before downloading. The downloaded video will be sent back to the user via the Telegram Bot. 
+A Telegram Bot that can download videos from Twitter, YouTube, etc. The downloaded video will be sent back to the user via the Telegram Bot. 
 
-## Deployment
+## Features
 
-### Install the dependencies
+- Download videos from various platforms using yt-dlp
+- Download audio-only version of videos
+- Compress videos for easier sharing
+- Split large files into smaller chunks for Telegram's file size limits
+- Configure proxy for downloads in regions with restrictions
+- User-specific settings saved between sessions
 
-1, Install the required python libs
-```
+## Requirements
+
+- Python 3.7+
+- ffmpeg installed on the system
+- yt-dlp installed on the system
+
+## Installation
+
+1. Clone this repository
+2. Install the required Python packages:
+
+```bash
 pip install -r requirements.txt
 ```
 
-2, Install `yt-dlp`
+3. Create a `.env` file with your configuration:
 
-Download the latest version of yt-dlp [here](https://github.com/yt-dlp/yt-dlp/releases). And then put it in one of the directories defined in the `PATH` environment variable. For example, `/usr/bin`. Remember to give the execution permission to `yt-dlp`. For example, `sudo chmod +x /usr/bin/yt-dlp`.
-
-3, Install `ffmpeg`
-
-Use the system command to install `ffmpeg`. For example, `sudo apt install ffmpeg`.
-
-### Specify the Bot Token
-
-Open the file `video_dl_bot.py` and replace `<Your-Telegram-Bot-Token>` with your Telegram Bot's token. Then save the changed file.
-
-### Run the Bot
-
-Run the Bot with the command:
 ```
-python3 video_dl_bot.py
+BOT_TOKEN=your_telegram_bot_token
+UPLOAD_SIZE_LIMIT_MB=50
+SPLIT_SIZE_LIMIT_MB=40
 ```
-A log file named `video_dl_bot.log` will be generated on the same directory you start the Bot. 
 
-It's better to run the Bot with a systemd service on Linux. Or run it with `nohup` in background with the command:
+## Usage
+
+1. Run the bot:
+
+```bash
+python video_dl_bot.py
 ```
-nohup python3 video_dl_bot.py &
-```
+
+2. Open Telegram and start a chat with your bot
+3. Use the `/settings` command to configure download preferences:
+   - Download Audio: Download audio version alongside video
+   - Audio Only: Download only audio, no video
+   - Compress Video: Compress large videos for easier sharing
+   - Split Large Files: Split videos exceeding Telegram's size limits
+   - Proxy: Set a proxy for downloads (with `/set_proxy` command)
+4. Send a video URL to the bot to download it
+
+## Deployment
+
+The bot can be deployed on any server with Python and the required dependencies installed.
+
+## License
+
+This project is open-source software.

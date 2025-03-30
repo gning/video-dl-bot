@@ -1,0 +1,48 @@
+# Environment variables
+.env
+.env.*
+
+# Virtual Environment
+venv/
+env/
+ENV/
+virtualenv/
+.Python
+
+# Bot downloads directory
+downloads/
+
+# Log files
+*.log
+logs/
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# User settings
+user_settings.json
+
+# IDE files
+.idea/
+.vscode/
+*.sublime-project
+*.sublime-workspace
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db 
