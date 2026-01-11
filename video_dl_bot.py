@@ -208,8 +208,9 @@ async def download_video(update: Update, context: CallbackContext) -> None:
     try:
         # Download video
         result = subprocess.run(video_command, shell=True, check=True, text=True, capture_output=True)
-        if result.stderr:
-            error_msg = f"Download failed with error:\n{result.stderr}"
+        #if result.stderr:
+        if result.returncode != 0:
+            error_msg = f"Download failed with command {video_command}:\n{result.stderr}"
             logger.error(error_msg)
             await update.message.reply_text(error_msg)
             return
