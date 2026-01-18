@@ -25,7 +25,10 @@ DEFAULT_SETTINGS = {
     'audio_only': False,
     'compress_video': True,
     'split_large_files': True,
-    'proxy_url': 'none'
+    'proxy_url': 'none',
+    'cookies_browser': 'none',  # Browser to extract cookies from (chrome, firefox, edge, safari, etc.)
+    'use_aria2': False,  # Use aria2c for faster downloads
+    'force_ipv4': False,  # Force IPv4 connections
 }
 
 # User settings dictionary
@@ -41,8 +44,9 @@ def load_settings():
                 
                 # Update existing users with new settings
                 for user_id in user_settings:
-                    if 'audio_only' not in user_settings[user_id]:
-                        user_settings[user_id]['audio_only'] = DEFAULT_SETTINGS['audio_only']
+                    for key, default_value in DEFAULT_SETTINGS.items():
+                        if key not in user_settings[user_id]:
+                            user_settings[user_id][key] = default_value
                 save_settings()
     except Exception as e:
         logger.error(f"Error loading settings: {e}")
@@ -67,7 +71,13 @@ logging.basicConfig(filename="video_dl_bot.log", filemode='a', format='%(asctime
 logger = logging.getLogger(__name__)
 
 async def start(update: Update, context: CallbackContext) -> None:
-    await update.message.reply_text('Hi! Send me a video URL to download.\nUse /settings to configure bot preferences.')
+    await update.message.reply_text(
+        'Hi! Send me a video URL to download.\n\n'
+        'Commands:\n'
+        '/settings - Configure download options\n'
+        '/set_proxy URL - Set proxy server\n'
+        '/set_cookies BROWSER - Use browser cookies for auth'
+    )
 
 async def settings_command(update: Update, context: CallbackContext) -> None:
     """Handle the /settings command"""
@@ -98,8 +108,20 @@ async def get_settings_keyboard(user_id: int) -> list:
             callback_data='toggle_split'
         )],
         [InlineKeyboardButton(
+            f"{'✅' if settings['use_aria2'] else '❌'} Use aria2 (faster)",
+            callback_data='toggle_aria2'
+        )],
+        [InlineKeyboardButton(
+            f"{'✅' if settings['force_ipv4'] else '❌'} Force IPv4",
+            callback_data='toggle_ipv4'
+        )],
+        [InlineKeyboardButton(
             f"🌐 Proxy: {settings['proxy_url']}",
             callback_data='show_proxy_info'
+        )],
+        [InlineKeyboardButton(
+            f"🍪 Cookies: {settings['cookies_browser']}",
+            callback_data='show_cookies_info'
         )]
     ]
     return keyboard
@@ -109,7 +131,7 @@ async def settings_button(update: Update, context: CallbackContext) -> None:
     query = update.callback_query
     user_id = str(update.effective_user.id)
     settings = get_user_settings(user_id)
-    
+
     if query.data == 'toggle_audio':
         settings['download_audio'] = not settings['download_audio']
         # If audio_only is enabled but download_audio is disabled, disable audio_only too
@@ -124,6 +146,10 @@ async def settings_button(update: Update, context: CallbackContext) -> None:
         settings['compress_video'] = not settings['compress_video']
     elif query.data == 'toggle_split':
         settings['split_large_files'] = not settings['split_large_files']
+    elif query.data == 'toggle_aria2':
+        settings['use_aria2'] = not settings['use_aria2']
+    elif query.data == 'toggle_ipv4':
+        settings['force_ipv4'] = not settings['force_ipv4']
     elif query.data == 'show_proxy_info':
         await query.answer(
             f"Current proxy: {settings['proxy_url']}\n"
@@ -131,9 +157,17 @@ async def settings_button(update: Update, context: CallbackContext) -> None:
             show_alert=True
         )
         return
-    
+    elif query.data == 'show_cookies_info':
+        await query.answer(
+            f"Current cookies browser: {settings['cookies_browser']}\n"
+            "Use /set_cookies BROWSER to change\n"
+            "(chrome, firefox, edge, safari, opera, brave)",
+            show_alert=True
+        )
+        return
+
     save_settings()
-    
+
     # Update the keyboard
     keyboard = await get_settings_keyboard(update.effective_user.id)
     await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(keyboard))
@@ -149,16 +183,45 @@ async def set_proxy_command(update: Update, context: CallbackContext) -> None:
         )
         return
 
-    user_settings = get_user_settings(update.effective_user.id)
+    settings = get_user_settings(update.effective_user.id)
     proxy_url = context.args[0].lower()
-    
+
     if proxy_url == 'none':
-        user_settings['proxy_url'] = 'none'
+        settings['proxy_url'] = 'none'
         await update.message.reply_text("Proxy disabled.")
     else:
-        user_settings['proxy_url'] = proxy_url
+        settings['proxy_url'] = proxy_url
         await update.message.reply_text(f"Proxy set to: {proxy_url}")
-    
+
+    save_settings()
+
+async def set_cookies_command(update: Update, context: CallbackContext) -> None:
+    """Handle the cookies browser setting command"""
+    valid_browsers = ['chrome', 'firefox', 'edge', 'safari', 'opera', 'brave', 'chromium', 'vivaldi', 'none']
+
+    if not context.args:
+        await update.message.reply_text(
+            "Please provide a browser name or 'none' to disable cookies.\n"
+            f"Valid browsers: {', '.join(valid_browsers[:-1])}\n"
+            "Example: /set_cookies chrome\n"
+            "Or: /set_cookies none"
+        )
+        return
+
+    settings = get_user_settings(update.effective_user.id)
+    browser = context.args[0].lower()
+
+    if browser not in valid_browsers:
+        await update.message.reply_text(f"Invalid browser. Valid options: {', '.join(valid_browsers)}")
+        return
+
+    if browser == 'none':
+        settings['cookies_browser'] = 'none'
+        await update.message.reply_text("Cookies disabled.")
+    else:
+        settings['cookies_browser'] = browser
+        await update.message.reply_text(f"Cookies browser set to: {browser}")
+
     save_settings()
 
 async def refine_url_and_filename(url: str) -> tuple:
@@ -168,6 +231,116 @@ async def refine_url_and_filename(url: str) -> tuple:
         refined_url = url.split('&')[0]
         filename_base = refined_url.split('?')[-1].split('=')[-1]
     return refined_url, filename_base
+
+def build_ytdlp_base_options(settings: dict) -> list:
+    """Build base yt-dlp options for improved success rate."""
+    options = [
+        # Retry mechanisms for network resilience
+        '--retries', '10',
+        '--fragment-retries', '10',
+        '--retry-sleep', '3',
+
+        # Geo-bypass options
+        '--geo-bypass',
+
+        # Rate-limiting protection
+        '--sleep-requests', '1',
+        '--sleep-interval', '1',
+        '--max-sleep-interval', '5',
+
+        # Concurrent fragments for faster downloads
+        '--concurrent-fragments', '4',
+
+        # Safety options
+        '--no-playlist',
+        '--no-overwrites',
+
+        # Better compatibility
+        '--no-check-certificates',
+        '--prefer-free-formats',
+
+        # Verbose progress for debugging
+        '--newline',
+    ]
+
+    # Add proxy if configured
+    if settings.get('proxy_url', 'none') != 'none':
+        options.extend(['--proxy', settings['proxy_url']])
+
+    # Add cookies from browser if configured
+    if settings.get('cookies_browser', 'none') != 'none':
+        options.extend(['--cookies-from-browser', settings['cookies_browser']])
+
+    # Force IPv4 if enabled
+    if settings.get('force_ipv4', False):
+        options.extend(['--force-ipv4'])
+
+    # Use aria2c for faster multi-connection downloads
+    if settings.get('use_aria2', False):
+        options.extend([
+            '--downloader', 'aria2c',
+            '--downloader-args', 'aria2c:-c -j 8 -x 8 -s 8 -k 1M'
+        ])
+
+    return options
+
+def build_video_command(url: str, output_path: str, settings: dict) -> list:
+    """Build yt-dlp command for video download with improved success rate."""
+    cmd = ['yt-dlp']
+    cmd.extend(build_ytdlp_base_options(settings))
+
+    # Improved format selection with fallbacks
+    # Priority: h264 video + best audio, then any video + audio, then best available
+    format_selection = (
+        'bestvideo[vcodec^=avc1][height<=1080]+bestaudio[acodec^=mp4a]/bestvideo[vcodec^=avc1]+bestaudio/'
+        'bestvideo[height<=1080]+bestaudio/bestvideo+bestaudio/best[height<=1080]/best'
+    )
+    cmd.extend(['-f', format_selection])
+
+    # Output format and path
+    cmd.extend([
+        '--merge-output-format', 'mp4',
+        '-o', f'{output_path}.%(ext)s'
+    ])
+
+    cmd.append(url)
+    return cmd
+
+def build_audio_command(url: str, output_path: str, settings: dict) -> list:
+    """Build yt-dlp command for audio-only download with improved success rate."""
+    cmd = ['yt-dlp']
+    cmd.extend(build_ytdlp_base_options(settings))
+
+    # Audio extraction options
+    cmd.extend([
+        '-x',
+        '--audio-format', 'mp3',
+        '--audio-quality', '0',  # Best quality
+        '-o', f'{output_path}.%(ext)s'
+    ])
+
+    cmd.append(url)
+    return cmd
+
+def run_ytdlp_command(cmd: list) -> tuple:
+    """Run yt-dlp command and return (success, stdout, stderr)."""
+    try:
+        result = subprocess.run(
+            cmd,
+            check=False,  # Don't raise exception, we'll check returncode
+            text=True,
+            capture_output=True,
+            timeout=600  # 10 minute timeout
+        )
+
+        # yt-dlp returns 0 on success, non-zero on failure
+        success = result.returncode == 0
+
+        return success, result.stdout, result.stderr
+    except subprocess.TimeoutExpired:
+        return False, '', 'Download timed out after 10 minutes'
+    except Exception as e:
+        return False, '', str(e)
 
 async def compress_video(file_path: str) -> str:
     """Compress video using ffmpeg and return the path to compressed file."""
@@ -183,117 +356,118 @@ async def compress_video(file_path: str) -> str:
         raise
 
 async def download_video(update: Update, context: CallbackContext) -> None:
-    user_settings = get_user_settings(update.effective_user.id)
+    settings = get_user_settings(update.effective_user.id)
     refined_url, filename_base = await refine_url_and_filename(update.message.text)
-    
+
     # Create downloads directory if it doesn't exist
     if not os.path.exists(SUBDIR):
         os.makedirs(SUBDIR)
-    
+
     # If audio_only is enabled, only download audio
-    if user_settings['audio_only']:
+    if settings['audio_only']:
         await update.message.reply_text(f"Downloading audio only from: {refined_url}")
-        await download_audio_only(update, context, refined_url, filename_base, user_settings)
+        await download_audio_only(update, context, refined_url, filename_base, settings)
         return
-    
-    await update.message.reply_text(f"Trying to download the video from: {refined_url}")
 
-    # Always download video
+    await update.message.reply_text(f"Downloading video from: {refined_url}")
+
+    # Build and run the improved yt-dlp command
     video_path = f'{SUBDIR}/{filename_base}'
-    video_command = f"yt-dlp -S vcodec:h264 --merge-output-format mp4 -o '{video_path}.%(ext)s' {shlex.quote(refined_url)}"
+    cmd = build_video_command(refined_url, video_path, settings)
+    logger.info(f"Running yt-dlp command: {' '.join(cmd)}")
 
-    if user_settings['proxy_url'] != 'none':
-        video_command += f" --proxy {shlex.quote(user_settings['proxy_url'])}"
+    success, stdout, stderr = run_ytdlp_command(cmd)
+
+    if not success:
+        # Extract meaningful error message from stderr
+        error_lines = [line for line in stderr.split('\n') if 'ERROR' in line or 'error' in line.lower()]
+        error_msg = '\n'.join(error_lines[-3:]) if error_lines else stderr[-500:] if stderr else 'Unknown error'
+        logger.error(f"Download failed: {stderr}")
+        await update.message.reply_text(f"Download failed:\n{error_msg}")
+        return
+
+    logger.info(f"Video downloaded successfully! Output:\n{stdout}")
 
     try:
-        # Download video
-        result = subprocess.run(video_command, shell=True, check=True, text=True, capture_output=True)
-        #if result.stderr:
-        if result.returncode != 0:
-            error_msg = f"Download failed with command {video_command}:\n{result.stderr}"
-            logger.error(error_msg)
-            await update.message.reply_text(error_msg)
-            return
-
-        logger.info(f"Video downloaded successfully! Output:\n{result.stdout}")
         video_file_path = find_downloaded_file(filename_base)
-        video_size = os.path.getsize(video_file_path)
-        await update.message.reply_text(f"Video downloaded successfully to {os.path.basename(video_file_path)} with size {video_size / MB_IN_BYTES:.2f} MB.")
+    except FileNotFoundError as e:
+        logger.error(f"Could not find downloaded file: {e}")
+        await update.message.reply_text(f"Download completed but file not found. Check logs for details.")
+        return
 
-        # Handle video sending
-        processing_error = None
-        try:
-            if video_size / MB_IN_BYTES > UPLOAD_SIZE_LIMIT_MB:
-                if user_settings['compress_video']:
-                    await update.message.reply_text("Video is too large. Compressing...")
-                    compressed_path = await compress_video(video_file_path)
-                    compressed_size = os.path.getsize(compressed_path)
-                    if compressed_size / MB_IN_BYTES <= UPLOAD_SIZE_LIMIT_MB:
-                        await send_video(update, context, compressed_path)
-                        os.remove(compressed_path)
-                    else:
-                        os.remove(compressed_path)
-                        if user_settings['split_large_files']:
-                            await split_and_send_video(update, context, video_file_path, filename_base)
-                        else:
-                            await update.message.reply_text("Video is too large to send, even after compression. Attempting to send directly...")
-                            await send_video(update, context, video_file_path)
-                elif user_settings['split_large_files']:
-                    await split_and_send_video(update, context, video_file_path, filename_base)
+    video_size = os.path.getsize(video_file_path)
+    await update.message.reply_text(f"Video downloaded: {os.path.basename(video_file_path)} ({video_size / MB_IN_BYTES:.2f} MB)")
+
+    # Handle video sending
+    try:
+        if video_size / MB_IN_BYTES > UPLOAD_SIZE_LIMIT_MB:
+            if settings['compress_video']:
+                await update.message.reply_text("Video is too large. Compressing...")
+                compressed_path = await compress_video(video_file_path)
+                compressed_size = os.path.getsize(compressed_path)
+                if compressed_size / MB_IN_BYTES <= UPLOAD_SIZE_LIMIT_MB:
+                    await send_video(update, context, compressed_path)
+                    os.remove(compressed_path)
                 else:
-                    await send_video(update, context, video_file_path)
+                    os.remove(compressed_path)
+                    if settings['split_large_files']:
+                        await split_and_send_video(update, context, video_file_path, filename_base)
+                    else:
+                        await update.message.reply_text("Video is too large to send, even after compression. Attempting to send directly...")
+                        await send_video(update, context, video_file_path)
+            elif settings['split_large_files']:
+                await split_and_send_video(update, context, video_file_path, filename_base)
             else:
                 await send_video(update, context, video_file_path)
-        except Exception as e:
-            processing_error = str(e)
-            logger.error(f"Error during video processing/sending: {processing_error}")
-            await update.message.reply_text(f"Error during video processing/sending: {processing_error}")
-
-        # Download audio if enabled and no fatal error occurred
-        if user_settings['download_audio'] and not user_settings['audio_only']:
-            await download_audio_only(update, context, refined_url, filename_base + "_audio", user_settings)
-
-        # Clean up video file
-        if 'video_file_path' in locals() and os.path.exists(video_file_path):
-            os.remove(video_file_path)
-
+        else:
+            await send_video(update, context, video_file_path)
     except Exception as e:
-        error_message = str(e)
-        logger.error(f"An error occurred during video download: {error_message}")
-        await update.message.reply_text(f"Failed to download the video: {error_message}")
+        logger.error(f"Error during video processing/sending: {e}")
+        await update.message.reply_text(f"Error during video processing/sending: {e}")
 
-async def download_audio_only(update: Update, context: CallbackContext, url: str, filename_base: str, user_settings: dict) -> None:
+    # Download audio if enabled and no fatal error occurred
+    if settings['download_audio'] and not settings['audio_only']:
+        await download_audio_only(update, context, refined_url, filename_base + "_audio", settings)
+
+    # Clean up video file
+    if os.path.exists(video_file_path):
+        os.remove(video_file_path)
+
+async def download_audio_only(update: Update, context: CallbackContext, url: str, filename_base: str, settings: dict) -> None:
     """Download audio only version of the content"""
-    try:
-        audio_path = f'{SUBDIR}/{filename_base}'
-        audio_command = f"yt-dlp -x --audio-format mp3 -o '{audio_path}.%(ext)s' {shlex.quote(url)}"
-        
-        if user_settings['proxy_url'] != 'none':
-            audio_command += f" --proxy {shlex.quote(user_settings['proxy_url'])}"
+    audio_path = f'{SUBDIR}/{filename_base}'
+    cmd = build_audio_command(url, audio_path, settings)
+    logger.info(f"Running yt-dlp audio command: {' '.join(cmd)}")
 
-        audio_result = subprocess.run(audio_command, shell=True, check=True, text=True, capture_output=True)
-        if audio_result.stderr:
-            await update.message.reply_text(f"Audio download failed with error:\n{audio_result.stderr}")
-            return
-            
+    success, stdout, stderr = run_ytdlp_command(cmd)
+
+    if not success:
+        error_lines = [line for line in stderr.split('\n') if 'ERROR' in line or 'error' in line.lower()]
+        error_msg = '\n'.join(error_lines[-3:]) if error_lines else stderr[-500:] if stderr else 'Unknown error'
+        logger.error(f"Audio download failed: {stderr}")
+        await update.message.reply_text(f"Audio download failed:\n{error_msg}")
+        return
+
+    try:
         audio_file_path = find_downloaded_file(filename_base)
-        try:
+    except FileNotFoundError as e:
+        logger.error(f"Could not find downloaded audio file: {e}")
+        await update.message.reply_text(f"Audio download completed but file not found.")
+        return
+
+    try:
+        with open(audio_file_path, 'rb') as audio_file:
             await context.bot.send_audio(
                 chat_id=update.effective_chat.id,
-                audio=open(audio_file_path, 'rb'),
-                caption=f"Audio version from {url}"
+                audio=audio_file,
+                caption=f"Audio from {url}"
             )
-        except Exception as e:
-            error_message = str(e)
-            logger.error(f"Failed to send audio: {error_message}")
-            await update.message.reply_text(f"Failed to send audio: {error_message}")
-        finally:
-            if os.path.exists(audio_file_path):
-                os.remove(audio_file_path)
     except Exception as e:
-        error_message = str(e)
-        logger.error(f"Failed to download audio: {error_message}")
-        await update.message.reply_text(f"Failed to download audio: {error_message}")
+        logger.error(f"Failed to send audio: {e}")
+        await update.message.reply_text(f"Failed to send audio: {e}")
+    finally:
+        if os.path.exists(audio_file_path):
+            os.remove(audio_file_path)
 
 async def split_and_send_video(update: Update, context: CallbackContext, full_file_path: str, filename_base: str) -> None:
     await update.message.reply_text("The video is larger than 50MB. Splitting it into smaller chunks...")
@@ -371,6 +545,7 @@ def main() -> None:
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("settings", settings_command))
     application.add_handler(CommandHandler("set_proxy", set_proxy_command))
+    application.add_handler(CommandHandler("set_cookies", set_cookies_command))
     application.add_handler(CallbackQueryHandler(settings_button))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, download_video))
 
