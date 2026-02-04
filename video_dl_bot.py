@@ -224,6 +224,15 @@ async def set_cookies_command(update: Update, context: CallbackContext) -> None:
 
     save_settings()
 
+def is_twitter_url(url: str) -> bool:
+    """Check if URL is a Twitter/X post that may contain multiple videos."""
+    twitter_patterns = (
+        'twitter.com/', 'x.com/',
+        'mobile.twitter.com/', 'mobile.x.com/',
+        'www.twitter.com/', 'www.x.com/'
+    )
+    return any(pattern in url.lower() for pattern in twitter_patterns)
+
 async def refine_url_and_filename(url: str) -> tuple:
     refined_url = url.split('?')[0]
     filename_base = refined_url.rstrip('/').split('/')[-1]
@@ -232,7 +241,7 @@ async def refine_url_and_filename(url: str) -> tuple:
         filename_base = refined_url.split('?')[-1].split('=')[-1]
     return refined_url, filename_base
 
-def build_ytdlp_base_options(settings: dict) -> list:
+def build_ytdlp_base_options(settings: dict, url: str = '') -> list:
     """Build base yt-dlp options for improved success rate."""
     options = [
         # Retry mechanisms for network resilience
@@ -252,7 +261,6 @@ def build_ytdlp_base_options(settings: dict) -> list:
         '--concurrent-fragments', '4',
 
         # Safety options
-        '--no-playlist',
         '--no-overwrites',
 
         # Better compatibility
@@ -262,6 +270,11 @@ def build_ytdlp_base_options(settings: dict) -> list:
         # Verbose progress for debugging
         '--newline',
     ]
+
+    # For Twitter/X, allow downloading all videos in a post
+    # For other platforms, use --no-playlist to avoid downloading entire playlists
+    if not is_twitter_url(url):
+        options.append('--no-playlist')
 
     # Add proxy if configured
     if settings.get('proxy_url', 'none') != 'none':
@@ -287,7 +300,7 @@ def build_ytdlp_base_options(settings: dict) -> list:
 def build_video_command(url: str, output_path: str, settings: dict) -> list:
     """Build yt-dlp command for video download with improved success rate."""
     cmd = ['yt-dlp']
-    cmd.extend(build_ytdlp_base_options(settings))
+    cmd.extend(build_ytdlp_base_options(settings, url))
 
     # Improved format selection with fallbacks
     # Priority: h264 video + best audio, then any video + audio, then best available
@@ -298,10 +311,17 @@ def build_video_command(url: str, output_path: str, settings: dict) -> list:
     cmd.extend(['-f', format_selection])
 
     # Output format and path
-    cmd.extend([
-        '--merge-output-format', 'mp4',
-        '-o', f'{output_path}.%(ext)s'
-    ])
+    # For Twitter/X, use playlist index to handle multiple videos
+    if is_twitter_url(url):
+        cmd.extend([
+            '--merge-output-format', 'mp4',
+            '-o', f'{output_path}_%(playlist_index|0)s.%(ext)s'
+        ])
+    else:
+        cmd.extend([
+            '--merge-output-format', 'mp4',
+            '-o', f'{output_path}.%(ext)s'
+        ])
 
     cmd.append(url)
     return cmd
@@ -309,15 +329,24 @@ def build_video_command(url: str, output_path: str, settings: dict) -> list:
 def build_audio_command(url: str, output_path: str, settings: dict) -> list:
     """Build yt-dlp command for audio-only download with improved success rate."""
     cmd = ['yt-dlp']
-    cmd.extend(build_ytdlp_base_options(settings))
+    cmd.extend(build_ytdlp_base_options(settings, url))
 
     # Audio extraction options
-    cmd.extend([
-        '-x',
-        '--audio-format', 'mp3',
-        '--audio-quality', '0',  # Best quality
-        '-o', f'{output_path}.%(ext)s'
-    ])
+    # For Twitter/X, use playlist index to handle multiple audio files
+    if is_twitter_url(url):
+        cmd.extend([
+            '-x',
+            '--audio-format', 'mp3',
+            '--audio-quality', '0',  # Best quality
+            '-o', f'{output_path}_%(playlist_index|0)s.%(ext)s'
+        ])
+    else:
+        cmd.extend([
+            '-x',
+            '--audio-format', 'mp3',
+            '--audio-quality', '0',  # Best quality
+            '-o', f'{output_path}.%(ext)s'
+        ])
 
     cmd.append(url)
     return cmd
@@ -355,6 +384,37 @@ async def compress_video(file_path: str) -> str:
         logger.error(f"Failed to compress video: {str(e)}")
         raise
 
+async def process_and_send_video(update: Update, context: CallbackContext, video_file_path: str, settings: dict) -> None:
+    """Process a single video file (compress/split if needed) and send it."""
+    filename_base = os.path.splitext(os.path.basename(video_file_path))[0]
+    video_size = os.path.getsize(video_file_path)
+
+    try:
+        if video_size / MB_IN_BYTES > UPLOAD_SIZE_LIMIT_MB:
+            if settings['compress_video']:
+                await update.message.reply_text(f"Video {os.path.basename(video_file_path)} is too large. Compressing...")
+                compressed_path = await compress_video(video_file_path)
+                compressed_size = os.path.getsize(compressed_path)
+                if compressed_size / MB_IN_BYTES <= UPLOAD_SIZE_LIMIT_MB:
+                    await send_video(update, context, compressed_path)
+                    os.remove(compressed_path)
+                else:
+                    os.remove(compressed_path)
+                    if settings['split_large_files']:
+                        await split_and_send_video(update, context, video_file_path, filename_base)
+                    else:
+                        await update.message.reply_text("Video is too large to send, even after compression. Attempting to send directly...")
+                        await send_video(update, context, video_file_path)
+            elif settings['split_large_files']:
+                await split_and_send_video(update, context, video_file_path, filename_base)
+            else:
+                await send_video(update, context, video_file_path)
+        else:
+            await send_video(update, context, video_file_path)
+    except Exception as e:
+        logger.error(f"Error during video processing/sending: {e}")
+        await update.message.reply_text(f"Error during video processing/sending: {e}")
+
 async def download_video(update: Update, context: CallbackContext) -> None:
     settings = get_user_settings(update.effective_user.id)
     refined_url, filename_base = await refine_url_and_filename(update.message.text)
@@ -388,50 +448,56 @@ async def download_video(update: Update, context: CallbackContext) -> None:
 
     logger.info(f"Video downloaded successfully! Output:\n{stdout}")
 
-    try:
-        video_file_path = find_downloaded_file(filename_base)
-    except FileNotFoundError as e:
-        logger.error(f"Could not find downloaded file: {e}")
-        await update.message.reply_text(f"Download completed but file not found. Check logs for details.")
-        return
+    # For Twitter/X, handle multiple videos
+    if is_twitter_url(refined_url):
+        try:
+            video_files = find_all_downloaded_files(filename_base)
+        except FileNotFoundError as e:
+            logger.error(f"Could not find downloaded files: {e}")
+            await update.message.reply_text(f"Download completed but files not found. Check logs for details.")
+            return
 
-    video_size = os.path.getsize(video_file_path)
-    await update.message.reply_text(f"Video downloaded: {os.path.basename(video_file_path)} ({video_size / MB_IN_BYTES:.2f} MB)")
+        num_videos = len(video_files)
+        if num_videos > 1:
+            await update.message.reply_text(f"Found {num_videos} videos in the post. Sending all...")
 
-    # Handle video sending
-    try:
-        if video_size / MB_IN_BYTES > UPLOAD_SIZE_LIMIT_MB:
-            if settings['compress_video']:
-                await update.message.reply_text("Video is too large. Compressing...")
-                compressed_path = await compress_video(video_file_path)
-                compressed_size = os.path.getsize(compressed_path)
-                if compressed_size / MB_IN_BYTES <= UPLOAD_SIZE_LIMIT_MB:
-                    await send_video(update, context, compressed_path)
-                    os.remove(compressed_path)
-                else:
-                    os.remove(compressed_path)
-                    if settings['split_large_files']:
-                        await split_and_send_video(update, context, video_file_path, filename_base)
-                    else:
-                        await update.message.reply_text("Video is too large to send, even after compression. Attempting to send directly...")
-                        await send_video(update, context, video_file_path)
-            elif settings['split_large_files']:
-                await split_and_send_video(update, context, video_file_path, filename_base)
+        for i, video_file_path in enumerate(video_files, 1):
+            video_size = os.path.getsize(video_file_path)
+            if num_videos > 1:
+                await update.message.reply_text(f"Sending video {i}/{num_videos}: {os.path.basename(video_file_path)} ({video_size / MB_IN_BYTES:.2f} MB)")
             else:
-                await send_video(update, context, video_file_path)
-        else:
-            await send_video(update, context, video_file_path)
-    except Exception as e:
-        logger.error(f"Error during video processing/sending: {e}")
-        await update.message.reply_text(f"Error during video processing/sending: {e}")
+                await update.message.reply_text(f"Video downloaded: {os.path.basename(video_file_path)} ({video_size / MB_IN_BYTES:.2f} MB)")
 
-    # Download audio if enabled and no fatal error occurred
-    if settings['download_audio'] and not settings['audio_only']:
-        await download_audio_only(update, context, refined_url, filename_base + "_audio", settings)
+            await process_and_send_video(update, context, video_file_path, settings)
 
-    # Clean up video file
-    if os.path.exists(video_file_path):
-        os.remove(video_file_path)
+            # Clean up video file
+            if os.path.exists(video_file_path):
+                os.remove(video_file_path)
+
+        # Download audio if enabled
+        if settings['download_audio'] and not settings['audio_only']:
+            await download_audio_only(update, context, refined_url, filename_base + "_audio", settings)
+    else:
+        # Single video handling for non-Twitter URLs
+        try:
+            video_file_path = find_downloaded_file(filename_base)
+        except FileNotFoundError as e:
+            logger.error(f"Could not find downloaded file: {e}")
+            await update.message.reply_text(f"Download completed but file not found. Check logs for details.")
+            return
+
+        video_size = os.path.getsize(video_file_path)
+        await update.message.reply_text(f"Video downloaded: {os.path.basename(video_file_path)} ({video_size / MB_IN_BYTES:.2f} MB)")
+
+        await process_and_send_video(update, context, video_file_path, settings)
+
+        # Download audio if enabled
+        if settings['download_audio'] and not settings['audio_only']:
+            await download_audio_only(update, context, refined_url, filename_base + "_audio", settings)
+
+        # Clean up video file
+        if os.path.exists(video_file_path):
+            os.remove(video_file_path)
 
 async def download_audio_only(update: Update, context: CallbackContext, url: str, filename_base: str, settings: dict) -> None:
     """Download audio only version of the content"""
@@ -448,26 +514,53 @@ async def download_audio_only(update: Update, context: CallbackContext, url: str
         await update.message.reply_text(f"Audio download failed:\n{error_msg}")
         return
 
-    try:
-        audio_file_path = find_downloaded_file(filename_base)
-    except FileNotFoundError as e:
-        logger.error(f"Could not find downloaded audio file: {e}")
-        await update.message.reply_text(f"Audio download completed but file not found.")
-        return
+    # For Twitter/X, handle multiple audio files
+    if is_twitter_url(url):
+        try:
+            audio_files = find_all_downloaded_files(filename_base)
+        except FileNotFoundError as e:
+            logger.error(f"Could not find downloaded audio files: {e}")
+            await update.message.reply_text(f"Audio download completed but files not found.")
+            return
 
-    try:
-        with open(audio_file_path, 'rb') as audio_file:
-            await context.bot.send_audio(
-                chat_id=update.effective_chat.id,
-                audio=audio_file,
-                caption=f"Audio from {url}"
-            )
-    except Exception as e:
-        logger.error(f"Failed to send audio: {e}")
-        await update.message.reply_text(f"Failed to send audio: {e}")
-    finally:
-        if os.path.exists(audio_file_path):
-            os.remove(audio_file_path)
+        num_audios = len(audio_files)
+        for i, audio_file_path in enumerate(audio_files, 1):
+            try:
+                with open(audio_file_path, 'rb') as audio_file:
+                    caption = f"Audio {i}/{num_audios} from {url}" if num_audios > 1 else f"Audio from {url}"
+                    await context.bot.send_audio(
+                        chat_id=update.effective_chat.id,
+                        audio=audio_file,
+                        caption=caption
+                    )
+            except Exception as e:
+                logger.error(f"Failed to send audio: {e}")
+                await update.message.reply_text(f"Failed to send audio {i}: {e}")
+            finally:
+                if os.path.exists(audio_file_path):
+                    os.remove(audio_file_path)
+    else:
+        # Single audio handling for non-Twitter URLs
+        try:
+            audio_file_path = find_downloaded_file(filename_base)
+        except FileNotFoundError as e:
+            logger.error(f"Could not find downloaded audio file: {e}")
+            await update.message.reply_text(f"Audio download completed but file not found.")
+            return
+
+        try:
+            with open(audio_file_path, 'rb') as audio_file:
+                await context.bot.send_audio(
+                    chat_id=update.effective_chat.id,
+                    audio=audio_file,
+                    caption=f"Audio from {url}"
+                )
+        except Exception as e:
+            logger.error(f"Failed to send audio: {e}")
+            await update.message.reply_text(f"Failed to send audio: {e}")
+        finally:
+            if os.path.exists(audio_file_path):
+                os.remove(audio_file_path)
 
 async def split_and_send_video(update: Update, context: CallbackContext, full_file_path: str, filename_base: str) -> None:
     await update.message.reply_text("The video is larger than 50MB. Splitting it into smaller chunks...")
@@ -526,10 +619,21 @@ async def send_video(update: Update, context: CallbackContext, file_path: str) -
         raise  # Re-raise to be handled by the caller
 
 def find_downloaded_file(filename_base: str) -> str:
+    """Find a single downloaded file matching the filename base."""
     for file in os.listdir(SUBDIR):
         if file.startswith(filename_base):
             return f"{SUBDIR}/{file}"
     raise FileNotFoundError(f"The file with base name {filename_base} was not found in {SUBDIR}.")
+
+def find_all_downloaded_files(filename_base: str) -> list:
+    """Find all downloaded files matching the filename base, sorted by name."""
+    files = []
+    for file in os.listdir(SUBDIR):
+        if file.startswith(filename_base):
+            files.append(f"{SUBDIR}/{file}")
+    if not files:
+        raise FileNotFoundError(f"No files with base name {filename_base} were found in {SUBDIR}.")
+    return sorted(files)
 
 def main() -> None:
     # Check if downloads directory exists
