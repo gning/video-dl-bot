@@ -255,12 +255,20 @@ def is_twitter_url(url: str) -> bool:
     )
     return any(pattern in url.lower() for pattern in twitter_patterns)
 
+def is_youtube_playlist_url(url: str) -> bool:
+    """Check if URL is a YouTube playlist (not a single video with a list param)."""
+    return 'youtube.com/playlist' in url.lower() and 'list=' in url.lower()
+
 async def refine_url_and_filename(url: str) -> tuple:
     refined_url = url.split('?')[0]
     filename_base = refined_url.rstrip('/').split('/')[-1]
     if url.startswith(("https://youtube.com/watch", "https://www.youtube.com/watch")):
         refined_url = url.split('&')[0]
         filename_base = refined_url.split('?')[-1].split('=')[-1]
+    elif is_youtube_playlist_url(url):
+        playlist_id = url.split('list=')[1].split('&')[0]
+        refined_url = f"https://www.youtube.com/playlist?list={playlist_id}"
+        filename_base = playlist_id
     return refined_url, filename_base
 
 def build_ytdlp_base_options(settings: dict, url: str = '') -> list:
@@ -293,9 +301,9 @@ def build_ytdlp_base_options(settings: dict, url: str = '') -> list:
         '--newline',
     ]
 
-    # For Twitter/X, allow downloading all videos in a post
-    # For other platforms, use --no-playlist to avoid downloading entire playlists
-    if not is_twitter_url(url):
+    # For Twitter/X and YouTube playlists, allow downloading all videos
+    # For other platforms, use --no-playlist to avoid accidentally downloading entire playlists
+    if not is_twitter_url(url) and not is_youtube_playlist_url(url):
         options.append('--no-playlist')
 
     # Add proxy if configured
@@ -365,8 +373,8 @@ def build_video_command(url: str, output_path: str, settings: dict) -> list:
     cmd.extend(['-f', format_selection])
 
     # Output format and path
-    # For Twitter/X, use playlist index to handle multiple videos
-    if is_twitter_url(url):
+    # For Twitter/X and YouTube playlists, use playlist index to handle multiple videos
+    if is_twitter_url(url) or is_youtube_playlist_url(url):
         cmd.extend([
             '--merge-output-format', 'mp4',
             '-o', f'{output_path}_%(playlist_index|0)s.%(ext)s'
@@ -386,8 +394,8 @@ def build_audio_command(url: str, output_path: str, settings: dict) -> list:
     cmd.extend(build_ytdlp_base_options(settings, url))
 
     # Audio extraction options
-    # For Twitter/X, use playlist index to handle multiple audio files
-    if is_twitter_url(url):
+    # For Twitter/X and YouTube playlists, use playlist index to handle multiple audio files
+    if is_twitter_url(url) or is_youtube_playlist_url(url):
         cmd.extend([
             '-x',
             '--audio-format', 'mp3',
@@ -502,8 +510,8 @@ async def download_video(update: Update, context: CallbackContext) -> None:
 
     logger.info(f"Video downloaded successfully! Output:\n{stdout}")
 
-    # For Twitter/X, handle multiple videos
-    if is_twitter_url(refined_url):
+    # For Twitter/X and YouTube playlists, handle multiple videos
+    if is_twitter_url(refined_url) or is_youtube_playlist_url(refined_url):
         try:
             video_files = find_all_downloaded_files(filename_base)
         except FileNotFoundError as e:
@@ -513,7 +521,7 @@ async def download_video(update: Update, context: CallbackContext) -> None:
 
         num_videos = len(video_files)
         if num_videos > 1:
-            await update.message.reply_text(f"Found {num_videos} videos in the post. Sending all...")
+            await update.message.reply_text(f"Found {num_videos} videos. Sending all...")
 
         for i, video_file_path in enumerate(video_files, 1):
             video_size = os.path.getsize(video_file_path)
@@ -568,8 +576,8 @@ async def download_audio_only(update: Update, context: CallbackContext, url: str
         await update.message.reply_text(f"Audio download failed:\n{error_msg}")
         return
 
-    # For Twitter/X, handle multiple audio files
-    if is_twitter_url(url):
+    # For Twitter/X and YouTube playlists, handle multiple audio files
+    if is_twitter_url(url) or is_youtube_playlist_url(url):
         try:
             audio_files = find_all_downloaded_files(filename_base)
         except FileNotFoundError as e:
