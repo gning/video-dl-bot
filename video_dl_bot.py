@@ -29,6 +29,7 @@ DEFAULT_SETTINGS = {
     'cookies_browser': 'none',  # Browser to extract cookies from (chrome, firefox, edge, safari, etc.)
     'use_aria2': False,  # Use aria2c for faster downloads
     'force_ipv4': False,  # Force IPv4 connections
+    'preferred_audio_lang': 'none',  # Preferred audio: 'original', 'zh' for Chinese, 'en' for English, 'none' for default
 }
 
 # User settings dictionary
@@ -122,9 +123,23 @@ async def get_settings_keyboard(user_id: int) -> list:
         [InlineKeyboardButton(
             f"🍪 Cookies: {settings['cookies_browser']}",
             callback_data='show_cookies_info'
+        )],
+        [InlineKeyboardButton(
+            f"🔊 Audio Language: {get_audio_lang_display(settings.get('preferred_audio_lang', 'none'))}",
+            callback_data='cycle_audio_lang'
         )]
     ]
     return keyboard
+
+def get_audio_lang_display(lang: str) -> str:
+    """Get display name for audio language setting."""
+    lang_names = {
+        'none': 'Default',
+        'original': 'Original',
+        'zh': 'Chinese',
+        'en': 'English'
+    }
+    return lang_names.get(lang, 'Default')
 
 async def settings_button(update: Update, context: CallbackContext) -> None:
     """Handle settings button presses"""
@@ -165,6 +180,13 @@ async def settings_button(update: Update, context: CallbackContext) -> None:
             show_alert=True
         )
         return
+    elif query.data == 'cycle_audio_lang':
+        # Cycle through: none -> original -> zh -> en -> none
+        current_lang = settings.get('preferred_audio_lang', 'none')
+        lang_cycle = ['none', 'original', 'zh', 'en']
+        current_index = lang_cycle.index(current_lang) if current_lang in lang_cycle else 0
+        next_index = (current_index + 1) % len(lang_cycle)
+        settings['preferred_audio_lang'] = lang_cycle[next_index]
 
     save_settings()
 
@@ -302,12 +324,44 @@ def build_video_command(url: str, output_path: str, settings: dict) -> list:
     cmd = ['yt-dlp']
     cmd.extend(build_ytdlp_base_options(settings, url))
 
-    # Improved format selection with fallbacks
-    # Priority: h264 video + best audio, then any video + audio, then best available
-    format_selection = (
-        'bestvideo[vcodec^=avc1][height<=1080]+bestaudio[acodec^=mp4a]/bestvideo[vcodec^=avc1]+bestaudio/'
-        'bestvideo[height<=1080]+bestaudio/bestvideo+bestaudio/best[height<=1080]/best'
+    # Check preferred audio language
+    preferred_lang = settings.get('preferred_audio_lang', 'none')
+
+    # Build format selection based on language preference
+    # Base format without language preference (uses default audio)
+    base_format = (
+        'bv*[vcodec^=avc1][height<=1080]+ba/bv*[vcodec^=avc1]+ba/'
+        'bv*[height<=1080]+ba/bv*+ba/best[height<=1080]/best'
     )
+
+    if preferred_lang == 'original':
+        # Select original audio track using format_note filter
+        format_selection = (
+            'bv*[vcodec^=avc1][height<=1080]+ba[format_note*=original]/'
+            'bv*[height<=1080]+ba[format_note*=original]/'
+            'bv*+ba[format_note*=original]/'
+            + base_format
+        )
+    elif preferred_lang == 'zh':
+        # Select Chinese audio - match zh in format_note (e.g., [zh-Hant], [zh-CN])
+        format_selection = (
+            'bv*[vcodec^=avc1][height<=1080]+ba[format_note*=zh]/'
+            'bv*[height<=1080]+ba[format_note*=zh]/'
+            'bv*+ba[format_note*=zh]/'
+            + base_format
+        )
+    elif preferred_lang == 'en':
+        # Select English audio - match en in format_note (e.g., [en-US], [en-GB])
+        format_selection = (
+            'bv*[vcodec^=avc1][height<=1080]+ba[format_note*=en]/'
+            'bv*[height<=1080]+ba[format_note*=en]/'
+            'bv*+ba[format_note*=en]/'
+            + base_format
+        )
+    else:
+        # Default: no preference, let yt-dlp choose
+        format_selection = base_format
+
     cmd.extend(['-f', format_selection])
 
     # Output format and path
