@@ -3,7 +3,10 @@ import math
 import logging
 import subprocess
 import shlex
+import asyncio
+from urllib.parse import urlparse, parse_qs
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import TimedOut
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackContext, CallbackQueryHandler
 import json
 from dotenv import load_dotenv
@@ -18,6 +21,10 @@ UPLOAD_SIZE_LIMIT_MB = int(os.getenv('UPLOAD_SIZE_LIMIT_MB', 50))
 SPLIT_SIZE_LIMIT_MB = int(os.getenv('SPLIT_SIZE_LIMIT_MB', 40)) #If one or more splitted file are bigger than UPLOAD_SIZE_LIMIT_MB, decrease this value
 SUBDIR = "downloads"
 SETTINGS_FILE = "user_settings.json"
+TELEGRAM_WRITE_TIMEOUT = 300.0
+TELEGRAM_READ_TIMEOUT = 300.0
+TELEGRAM_CONNECT_TIMEOUT = 30.0
+PLAYLIST_RANGE_REPLY_TIMEOUT = 30
 
 # Default user settings
 DEFAULT_SETTINGS = {
@@ -30,10 +37,12 @@ DEFAULT_SETTINGS = {
     'use_aria2': False,  # Use aria2c for faster downloads
     'force_ipv4': False,  # Force IPv4 connections
     'preferred_audio_lang': 'none',  # Preferred audio: 'original', 'zh' for Chinese, 'en' for English, 'none' for default
+    'download_timeout_minutes': 60,  # Maximum time to download one item
 }
 
 # User settings dictionary
 user_settings = {}
+pending_playlist_ranges = {}
 
 def load_settings():
     """Load user settings from file"""
@@ -48,6 +57,7 @@ def load_settings():
                     for key, default_value in DEFAULT_SETTINGS.items():
                         if key not in user_settings[user_id]:
                             user_settings[user_id][key] = default_value
+                    user_settings[user_id].pop('playlist_timeout_minutes', None)
                 save_settings()
     except Exception as e:
         logger.error(f"Error loading settings: {e}")
@@ -76,8 +86,9 @@ async def start(update: Update, context: CallbackContext) -> None:
         'Hi! Send me a video URL to download.\n\n'
         'Commands:\n'
         '/settings - Configure download options\n'
-        '/set_proxy URL - Set proxy server\n'
-        '/set_cookies BROWSER - Use browser cookies for auth'
+        '/set-proxy URL - Set proxy server\n'
+        '/set-cookies BROWSER - Use browser cookies for auth\n'
+        '/set-download-timeout MINUTES - Set single download timeout'
     )
 
 async def settings_command(update: Update, context: CallbackContext) -> None:
@@ -127,6 +138,10 @@ async def get_settings_keyboard(user_id: int) -> list:
         [InlineKeyboardButton(
             f"🔊 Audio Language: {get_audio_lang_display(settings.get('preferred_audio_lang', 'none'))}",
             callback_data='cycle_audio_lang'
+        )],
+        [InlineKeyboardButton(
+            f"⏳ Download Timeout: {settings.get('download_timeout_minutes', 60)} min",
+            callback_data='show_download_timeout_info'
         )]
     ]
     return keyboard
@@ -168,14 +183,14 @@ async def settings_button(update: Update, context: CallbackContext) -> None:
     elif query.data == 'show_proxy_info':
         await query.answer(
             f"Current proxy: {settings['proxy_url']}\n"
-            "Use /set_proxy URL to change",
+            "Use /set-proxy URL to change",
             show_alert=True
         )
         return
     elif query.data == 'show_cookies_info':
         await query.answer(
             f"Current cookies browser: {settings['cookies_browser']}\n"
-            "Use /set_cookies BROWSER to change\n"
+            "Use /set-cookies BROWSER to change\n"
             "(chrome, firefox, edge, safari, opera, brave)",
             show_alert=True
         )
@@ -187,6 +202,13 @@ async def settings_button(update: Update, context: CallbackContext) -> None:
         current_index = lang_cycle.index(current_lang) if current_lang in lang_cycle else 0
         next_index = (current_index + 1) % len(lang_cycle)
         settings['preferred_audio_lang'] = lang_cycle[next_index]
+    elif query.data == 'show_download_timeout_info':
+        await query.answer(
+            f"Current single download timeout: {settings.get('download_timeout_minutes', 60)} minutes\n"
+            "Use /set-download-timeout MINUTES to change",
+            show_alert=True
+        )
+        return
 
     save_settings()
 
@@ -195,18 +217,167 @@ async def settings_button(update: Update, context: CallbackContext) -> None:
     await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(keyboard))
     await query.answer()
 
+def get_message_args(update: Update, context: CallbackContext) -> list:
+    """Return command arguments for both standard and dashed command handlers."""
+    if getattr(context, 'args', None):
+        return context.args
+    if update.message and update.message.text:
+        return update.message.text.split()[1:]
+    return []
+
+def get_chat_user_key(update: Update) -> tuple:
+    """Return a key for pending per-chat, per-user prompts."""
+    return update.effective_chat.id, update.effective_user.id
+
+def parse_playlist_index(text: str, minimum: int, maximum: int) -> int:
+    """Parse and clamp a playlist index."""
+    index = int(text.strip())
+    return max(minimum, min(index, maximum))
+
+async def start_playlist_range_prompt(
+    update: Update,
+    context: CallbackContext,
+    *,
+    url: str,
+    filename_base: str,
+    settings: dict,
+    entries: list,
+    mode: str
+) -> None:
+    """Ask the user for playlist start/end range before processing."""
+    key = get_chat_user_key(update)
+    existing_request = pending_playlist_ranges.pop(key, None)
+    if existing_request and existing_request.get('timeout_task'):
+        existing_request['timeout_task'].cancel()
+
+    item_name = 'video' if mode == 'video' else 'audio'
+    request = {
+        'stage': 'start',
+        'url': url,
+        'filename_base': filename_base,
+        'settings': settings.copy(),
+        'entries': entries,
+        'mode': mode,
+        'update': update,
+        'item_name': item_name,
+        'timeout_task': None,
+    }
+    pending_playlist_ranges[key] = request
+
+    await update.message.reply_text(
+        f"Found {len(entries)} {item_name}s. Reply with the start index number within "
+        f"{PLAYLIST_RANGE_REPLY_TIMEOUT} seconds. Default: 1."
+    )
+    schedule_playlist_range_timeout(context, key, 'start')
+
+def schedule_playlist_range_timeout(context: CallbackContext, key: tuple, stage: str) -> None:
+    """Schedule a default answer for a playlist range prompt."""
+    request = pending_playlist_ranges.get(key)
+    if not request:
+        return
+
+    timeout_task = request.get('timeout_task')
+    if timeout_task and not timeout_task.done() and timeout_task is not asyncio.current_task():
+        timeout_task.cancel()
+
+    request['timeout_task'] = context.application.create_task(
+        playlist_range_timeout(context, key, stage)
+    )
+
+async def playlist_range_timeout(context: CallbackContext, key: tuple, stage: str) -> None:
+    """Apply default playlist range values when the user does not reply."""
+    await asyncio.sleep(PLAYLIST_RANGE_REPLY_TIMEOUT)
+
+    request = pending_playlist_ranges.get(key)
+    if not request or request.get('stage') != stage:
+        return
+
+    if stage == 'start':
+        request['start_index'] = 1
+        request['stage'] = 'end'
+        await context.bot.send_message(
+            chat_id=key[0],
+            text=(
+                "No start index received. Using 1.\n"
+                f"Reply with the end index number within {PLAYLIST_RANGE_REPLY_TIMEOUT} seconds. "
+                f"Default: {len(request['entries'])}."
+            )
+        )
+        schedule_playlist_range_timeout(context, key, 'end')
+        return
+
+    pending_playlist_ranges.pop(key, None)
+    end_index = len(request['entries'])
+    await context.bot.send_message(
+        chat_id=key[0],
+        text=f"No end index received. Using {end_index}."
+    )
+    await process_playlist_range(context, request, request['start_index'], end_index)
+
+async def handle_playlist_range_reply(update: Update, context: CallbackContext) -> bool:
+    """Consume text replies for pending playlist range prompts."""
+    key = get_chat_user_key(update)
+    request = pending_playlist_ranges.get(key)
+    if not request:
+        return False
+
+    text = update.message.text.strip()
+    item_name = request['item_name']
+    max_index = len(request['entries'])
+
+    try:
+        if request['stage'] == 'start':
+            start_index = parse_playlist_index(text, 1, max_index)
+            request['start_index'] = start_index
+            request['stage'] = 'end'
+
+            if request.get('timeout_task'):
+                request['timeout_task'].cancel()
+
+            await update.message.reply_text(
+                f"Start index set to {start_index}. Reply with the end index number within "
+                f"{PLAYLIST_RANGE_REPLY_TIMEOUT} seconds. Default: {max_index}."
+            )
+            schedule_playlist_range_timeout(context, key, 'end')
+            return True
+
+        start_index = request['start_index']
+        end_index = parse_playlist_index(text, start_index, max_index)
+
+        if request.get('timeout_task'):
+            request['timeout_task'].cancel()
+        pending_playlist_ranges.pop(key, None)
+
+        await update.message.reply_text(
+            f"Downloading playlist {item_name}s from index {start_index} to {end_index}."
+        )
+        await process_playlist_range(context, request, start_index, end_index)
+        return True
+    except ValueError:
+        await update.message.reply_text(
+            f"Please reply with a whole number between 1 and {max_index}."
+        )
+        return True
+
+async def handle_text_message(update: Update, context: CallbackContext) -> None:
+    """Route text messages to pending prompts or the URL downloader."""
+    if await handle_playlist_range_reply(update, context):
+        return
+    await download_video(update, context)
+
 async def set_proxy_command(update: Update, context: CallbackContext) -> None:
     """Handle the proxy URL setting command"""
-    if not context.args:
+    args = get_message_args(update, context)
+    if not args:
         await update.message.reply_text(
             "Please provide a proxy URL or 'none' to disable proxy.\n"
-            "Example: /set_proxy http://proxy.example.com:8080\n"
-            "Or: /set_proxy none"
+            "Example: /set-proxy http://proxy.example.com:8080\n"
+            "Or: /set-proxy none"
         )
         return
 
     settings = get_user_settings(update.effective_user.id)
-    proxy_url = context.args[0].lower()
+    proxy_url = args[0].lower()
 
     if proxy_url == 'none':
         settings['proxy_url'] = 'none'
@@ -220,18 +391,19 @@ async def set_proxy_command(update: Update, context: CallbackContext) -> None:
 async def set_cookies_command(update: Update, context: CallbackContext) -> None:
     """Handle the cookies browser setting command"""
     valid_browsers = ['chrome', 'firefox', 'edge', 'safari', 'opera', 'brave', 'chromium', 'vivaldi', 'none']
+    args = get_message_args(update, context)
 
-    if not context.args:
+    if not args:
         await update.message.reply_text(
             "Please provide a browser name or 'none' to disable cookies.\n"
             f"Valid browsers: {', '.join(valid_browsers[:-1])}\n"
-            "Example: /set_cookies chrome\n"
-            "Or: /set_cookies none"
+            "Example: /set-cookies chrome\n"
+            "Or: /set-cookies none"
         )
         return
 
     settings = get_user_settings(update.effective_user.id)
-    browser = context.args[0].lower()
+    browser = args[0].lower()
 
     if browser not in valid_browsers:
         await update.message.reply_text(f"Invalid browser. Valid options: {', '.join(valid_browsers)}")
@@ -245,6 +417,31 @@ async def set_cookies_command(update: Update, context: CallbackContext) -> None:
         await update.message.reply_text(f"Cookies browser set to: {browser}")
 
     save_settings()
+
+async def set_download_timeout_command(update: Update, context: CallbackContext) -> None:
+    """Handle the single download timeout setting command."""
+    args = get_message_args(update, context)
+    if not args:
+        await update.message.reply_text(
+            "Please provide the single download timeout in minutes.\n"
+            "Example: /set-download-timeout 60"
+        )
+        return
+
+    try:
+        timeout_minutes = int(args[0])
+    except ValueError:
+        await update.message.reply_text("Download timeout must be a whole number of minutes.")
+        return
+
+    if timeout_minutes < 1 or timeout_minutes > 1440:
+        await update.message.reply_text("Download timeout must be between 1 and 1440 minutes.")
+        return
+
+    settings = get_user_settings(update.effective_user.id)
+    settings['download_timeout_minutes'] = timeout_minutes
+    save_settings()
+    await update.message.reply_text(f"Single download timeout set to {timeout_minutes} minutes.")
 
 def is_twitter_url(url: str) -> bool:
     """Check if URL is a Twitter/X post that may contain multiple videos."""
@@ -270,6 +467,71 @@ async def refine_url_and_filename(url: str) -> tuple:
         refined_url = f"https://www.youtube.com/playlist?list={playlist_id}"
         filename_base = playlist_id
     return refined_url, filename_base
+
+def extract_error_message(stderr: str) -> str:
+    """Extract a short user-facing error from yt-dlp stderr."""
+    error_lines = [line for line in stderr.split('\n') if 'ERROR' in line or 'error' in line.lower()]
+    return '\n'.join(error_lines[-3:]) if error_lines else stderr[-500:] if stderr else 'Unknown error'
+
+def get_youtube_playlist_id(url: str) -> str:
+    """Return the YouTube playlist id from a playlist URL."""
+    return parse_qs(urlparse(url).query).get('list', ['playlist'])[0]
+
+def get_youtube_video_id(entry: dict) -> str:
+    """Return a YouTube video id from a yt-dlp flat playlist entry."""
+    if entry.get('id'):
+        return entry['id']
+
+    for key in ('webpage_url', 'url'):
+        value = entry.get(key)
+        if not value:
+            continue
+        parsed_url = urlparse(str(value))
+        video_id = parse_qs(parsed_url.query).get('v', [''])[0]
+        if video_id:
+            return video_id
+
+    return ''
+
+def build_playlist_entry_url(entry: dict, playlist_id: str = '', index: int = None) -> str:
+    """Build a downloadable URL from a yt-dlp flat playlist entry."""
+    video_id = get_youtube_video_id(entry)
+    if playlist_id and video_id:
+        video_url = f"https://www.youtube.com/watch?v={video_id}&list={playlist_id}"
+        if index is not None:
+            video_url += f"&index={index}"
+        return video_url
+
+    if entry.get('webpage_url'):
+        return entry['webpage_url']
+    if entry.get('url') and str(entry['url']).startswith(('http://', 'https://')):
+        return entry['url']
+    if video_id:
+        return f"https://www.youtube.com/watch?v={video_id}"
+    if entry.get('url'):
+        return f"https://www.youtube.com/watch?v={entry['url']}"
+    return ''
+
+def get_youtube_playlist_entries(url: str, settings: dict, timeout_seconds: int) -> tuple:
+    """Fetch a flat list of YouTube playlist entries."""
+    cmd = ['yt-dlp']
+    cmd.extend(build_ytdlp_base_options(settings, url))
+    cmd.extend(['--flat-playlist', '--dump-single-json', url])
+
+    success, stdout, stderr = run_ytdlp_command(cmd, timeout_seconds=timeout_seconds)
+    if not success:
+        return False, [], stderr
+
+    try:
+        playlist_data = json.loads(stdout)
+    except json.JSONDecodeError as e:
+        return False, [], f"Could not parse playlist metadata: {e}"
+
+    entries = [
+        entry for entry in playlist_data.get('entries', [])
+        if entry and build_playlist_entry_url(entry)
+    ]
+    return True, entries, ''
 
 def build_ytdlp_base_options(settings: dict, url: str = '') -> list:
     """Build base yt-dlp options for improved success rate."""
@@ -413,7 +675,7 @@ def build_audio_command(url: str, output_path: str, settings: dict) -> list:
     cmd.append(url)
     return cmd
 
-def run_ytdlp_command(cmd: list) -> tuple:
+def run_ytdlp_command(cmd: list, timeout_seconds: int = 600) -> tuple:
     """Run yt-dlp command and return (success, stdout, stderr)."""
     try:
         result = subprocess.run(
@@ -421,7 +683,7 @@ def run_ytdlp_command(cmd: list) -> tuple:
             check=False,  # Don't raise exception, we'll check returncode
             text=True,
             capture_output=True,
-            timeout=600  # 10 minute timeout
+            timeout=timeout_seconds
         )
 
         # yt-dlp returns 0 on success, non-zero on failure
@@ -429,9 +691,14 @@ def run_ytdlp_command(cmd: list) -> tuple:
 
         return success, result.stdout, result.stderr
     except subprocess.TimeoutExpired:
-        return False, '', 'Download timed out after 10 minutes'
+        timeout_minutes = max(1, math.ceil(timeout_seconds / 60))
+        return False, '', f'Download timed out after {timeout_minutes} minutes'
     except Exception as e:
         return False, '', str(e)
+
+def get_download_timeout_seconds(settings: dict) -> int:
+    """Return the per-item download timeout in seconds."""
+    return int(settings.get('download_timeout_minutes', 60)) * 60
 
 async def compress_video(file_path: str) -> str:
     """Compress video using ffmpeg and return the path to compressed file."""
@@ -446,7 +713,7 @@ async def compress_video(file_path: str) -> str:
         logger.error(f"Failed to compress video: {str(e)}")
         raise
 
-async def process_and_send_video(update: Update, context: CallbackContext, video_file_path: str, settings: dict) -> None:
+async def process_and_send_video(update: Update, context: CallbackContext, video_file_path: str, settings: dict) -> bool:
     """Process a single video file (compress/split if needed) and send it."""
     filename_base = os.path.splitext(os.path.basename(video_file_path))[0]
     video_size = os.path.getsize(video_file_path)
@@ -473,13 +740,198 @@ async def process_and_send_video(update: Update, context: CallbackContext, video
                 await send_video(update, context, video_file_path)
         else:
             await send_video(update, context, video_file_path)
+        return True
     except Exception as e:
         logger.error(f"Error during video processing/sending: {e}")
         await update.message.reply_text(f"Error during video processing/sending: {e}")
+        return False
+
+async def process_playlist_range(context: CallbackContext, request: dict, start_index: int, end_index: int) -> None:
+    """Download and send a selected inclusive playlist range."""
+    update = request['update']
+    url = request['url']
+    filename_base = request['filename_base']
+    settings = request['settings']
+    entries = request['entries']
+    mode = request['mode']
+    item_name = request['item_name']
+    download_timeout_seconds = get_download_timeout_seconds(settings)
+    playlist_id = get_youtube_playlist_id(url)
+    selected_entries = entries[start_index - 1:end_index]
+    sent_count = 0
+    failed_count = 0
+
+    if not selected_entries:
+        await update.message.reply_text("No playlist items selected.")
+        return
+
+    await update.message.reply_text(
+        f"Starting playlist {item_name} download for index {start_index} to {end_index} "
+        f"({len(selected_entries)} {item_name}s)."
+    )
+
+    for offset, entry in enumerate(selected_entries):
+        index = start_index + offset
+        item_url = build_playlist_entry_url(entry, playlist_id, index)
+        title = entry.get('title') or f"{item_name} {index}"
+        item_filename_base = (
+            f"{filename_base}_audio_{update.message.message_id}_{index:03d}"
+            if mode == 'audio'
+            else f"{filename_base}_{update.message.message_id}_{index:03d}"
+        )
+        item_path = f'{SUBDIR}/{item_filename_base}'
+
+        await update.message.reply_text(
+            f"Downloading playlist {item_name} {index}/{len(entries)}: {title}\n{item_url}"
+        )
+
+        cmd = (
+            build_audio_command(item_url, item_path, settings)
+            if mode == 'audio'
+            else build_video_command(item_url, item_path, settings)
+        )
+        logger.info(f"Running yt-dlp playlist {item_name} command: {' '.join(cmd)}")
+
+        success, stdout, stderr = run_ytdlp_command(cmd, timeout_seconds=download_timeout_seconds)
+
+        if not success:
+            failed_count += 1
+            error_msg = extract_error_message(stderr)
+            logger.error(f"Playlist {item_name} download failed for {item_url}: {stderr}")
+            await update.message.reply_text(
+                f"Failed to download playlist {item_name} {index}/{len(entries)}:\n"
+                f"{item_url}\n{error_msg}"
+            )
+            continue
+
+        logger.info(f"Playlist {item_name} downloaded successfully ({playlist_id} #{index}). Output:\n{stdout}")
+
+        try:
+            downloaded_file_path = find_downloaded_file(item_filename_base)
+        except FileNotFoundError as e:
+            failed_count += 1
+            logger.error(f"Could not find downloaded playlist {item_name} file: {e}")
+            await update.message.reply_text(
+                f"Download completed but file was not found for playlist {item_name} {index}/{len(entries)}:\n{item_url}"
+            )
+            continue
+
+        if mode == 'audio':
+            caption = f"Audio {index}/{len(entries)} from {item_url}"
+            if await send_audio_file(update, context, downloaded_file_path, caption):
+                sent_count += 1
+            else:
+                failed_count += 1
+
+            if os.path.exists(downloaded_file_path):
+                os.remove(downloaded_file_path)
+            continue
+
+        video_size = os.path.getsize(downloaded_file_path)
+        await update.message.reply_text(
+            f"Video downloaded: {os.path.basename(downloaded_file_path)} ({video_size / MB_IN_BYTES:.2f} MB)"
+        )
+
+        if await process_and_send_video(update, context, downloaded_file_path, settings):
+            sent_count += 1
+        else:
+            failed_count += 1
+
+        if os.path.exists(downloaded_file_path):
+            os.remove(downloaded_file_path)
+
+        if settings['download_audio'] and not settings['audio_only']:
+            await download_audio_only(
+                update,
+                context,
+                item_url,
+                f"{item_filename_base}_audio",
+                settings
+            )
+
+    await update.message.reply_text(
+        f"Playlist {item_name} processing finished. Sent {sent_count} {item_name}s. Failed {failed_count} {item_name}s."
+    )
+
+async def download_youtube_playlist(update: Update, context: CallbackContext, url: str, filename_base: str, settings: dict) -> None:
+    """Fetch a YouTube playlist and ask which video range to download."""
+    download_timeout_seconds = get_download_timeout_seconds(settings)
+
+    await update.message.reply_text(f"Fetching playlist videos from: {url}")
+
+    success, entries, stderr = get_youtube_playlist_entries(url, settings, download_timeout_seconds)
+    if not success:
+        error_msg = extract_error_message(stderr)
+        logger.error(f"Failed to fetch playlist entries: {stderr}")
+        await update.message.reply_text(f"Failed to fetch playlist:\n{error_msg}")
+        return
+
+    if not entries:
+        await update.message.reply_text("Playlist contains no downloadable videos.")
+        return
+
+    await start_playlist_range_prompt(
+        update,
+        context,
+        url=url,
+        filename_base=filename_base,
+        settings=settings,
+        entries=entries,
+        mode='video'
+    )
+
+async def send_audio_file(update: Update, context: CallbackContext, audio_file_path: str, caption: str) -> bool:
+    """Send a single audio file with the provided caption."""
+    try:
+        with open(audio_file_path, 'rb') as audio_file:
+            await context.bot.send_audio(
+                chat_id=update.effective_chat.id,
+                audio=audio_file,
+                caption=caption,
+                write_timeout=TELEGRAM_WRITE_TIMEOUT,
+                read_timeout=TELEGRAM_READ_TIMEOUT,
+                connect_timeout=TELEGRAM_CONNECT_TIMEOUT
+            )
+        return True
+    except TimedOut as e:
+        logger.warning(f"Telegram timed out while sending audio file {audio_file_path}: {e}")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to send audio: {e}")
+        await update.message.reply_text(f"Failed to send audio: {e}")
+        return False
+
+async def download_youtube_playlist_audio(update: Update, context: CallbackContext, url: str, filename_base: str, settings: dict) -> None:
+    """Fetch a YouTube playlist and ask which audio range to download."""
+    download_timeout_seconds = get_download_timeout_seconds(settings)
+
+    await update.message.reply_text(f"Fetching playlist audios from: {url}")
+
+    success, entries, stderr = get_youtube_playlist_entries(url, settings, download_timeout_seconds)
+    if not success:
+        error_msg = extract_error_message(stderr)
+        logger.error(f"Failed to fetch playlist entries for audio: {stderr}")
+        await update.message.reply_text(f"Failed to fetch playlist:\n{error_msg}")
+        return
+
+    if not entries:
+        await update.message.reply_text("Playlist contains no downloadable audios.")
+        return
+
+    await start_playlist_range_prompt(
+        update,
+        context,
+        url=url,
+        filename_base=filename_base,
+        settings=settings,
+        entries=entries,
+        mode='audio'
+    )
 
 async def download_video(update: Update, context: CallbackContext) -> None:
     settings = get_user_settings(update.effective_user.id)
     refined_url, filename_base = await refine_url_and_filename(update.message.text)
+    download_timeout_seconds = get_download_timeout_seconds(settings)
 
     # Create downloads directory if it doesn't exist
     if not os.path.exists(SUBDIR):
@@ -487,8 +939,16 @@ async def download_video(update: Update, context: CallbackContext) -> None:
 
     # If audio_only is enabled, only download audio
     if settings['audio_only']:
+        if is_youtube_playlist_url(refined_url):
+            await download_youtube_playlist_audio(update, context, refined_url, filename_base, settings)
+            return
+
         await update.message.reply_text(f"Downloading audio only from: {refined_url}")
         await download_audio_only(update, context, refined_url, filename_base, settings)
+        return
+
+    if is_youtube_playlist_url(refined_url):
+        await download_youtube_playlist(update, context, refined_url, filename_base, settings)
         return
 
     await update.message.reply_text(f"Downloading video from: {refined_url}")
@@ -498,12 +958,11 @@ async def download_video(update: Update, context: CallbackContext) -> None:
     cmd = build_video_command(refined_url, video_path, settings)
     logger.info(f"Running yt-dlp command: {' '.join(cmd)}")
 
-    success, stdout, stderr = run_ytdlp_command(cmd)
+    success, stdout, stderr = run_ytdlp_command(cmd, timeout_seconds=download_timeout_seconds)
 
     if not success:
         # Extract meaningful error message from stderr
-        error_lines = [line for line in stderr.split('\n') if 'ERROR' in line or 'error' in line.lower()]
-        error_msg = '\n'.join(error_lines[-3:]) if error_lines else stderr[-500:] if stderr else 'Unknown error'
+        error_msg = extract_error_message(stderr)
         logger.error(f"Download failed: {stderr}")
         await update.message.reply_text(f"Download failed:\n{error_msg}")
         return
@@ -561,17 +1020,19 @@ async def download_video(update: Update, context: CallbackContext) -> None:
         if os.path.exists(video_file_path):
             os.remove(video_file_path)
 
-async def download_audio_only(update: Update, context: CallbackContext, url: str, filename_base: str, settings: dict) -> None:
+async def download_audio_only(update: Update, context: CallbackContext, url: str, filename_base: str, settings: dict, timeout_seconds: int = None) -> None:
     """Download audio only version of the content"""
     audio_path = f'{SUBDIR}/{filename_base}'
     cmd = build_audio_command(url, audio_path, settings)
     logger.info(f"Running yt-dlp audio command: {' '.join(cmd)}")
 
-    success, stdout, stderr = run_ytdlp_command(cmd)
+    if timeout_seconds is None:
+        timeout_seconds = get_download_timeout_seconds(settings)
+
+    success, stdout, stderr = run_ytdlp_command(cmd, timeout_seconds=timeout_seconds)
 
     if not success:
-        error_lines = [line for line in stderr.split('\n') if 'ERROR' in line or 'error' in line.lower()]
-        error_msg = '\n'.join(error_lines[-3:]) if error_lines else stderr[-500:] if stderr else 'Unknown error'
+        error_msg = extract_error_message(stderr)
         logger.error(f"Audio download failed: {stderr}")
         await update.message.reply_text(f"Audio download failed:\n{error_msg}")
         return
@@ -588,13 +1049,8 @@ async def download_audio_only(update: Update, context: CallbackContext, url: str
         num_audios = len(audio_files)
         for i, audio_file_path in enumerate(audio_files, 1):
             try:
-                with open(audio_file_path, 'rb') as audio_file:
-                    caption = f"Audio {i}/{num_audios} from {url}" if num_audios > 1 else f"Audio from {url}"
-                    await context.bot.send_audio(
-                        chat_id=update.effective_chat.id,
-                        audio=audio_file,
-                        caption=caption
-                    )
+                caption = f"Audio {i}/{num_audios} from {url}" if num_audios > 1 else f"Audio from {url}"
+                await send_audio_file(update, context, audio_file_path, caption)
             except Exception as e:
                 logger.error(f"Failed to send audio: {e}")
                 await update.message.reply_text(f"Failed to send audio {i}: {e}")
@@ -611,12 +1067,7 @@ async def download_audio_only(update: Update, context: CallbackContext, url: str
             return
 
         try:
-            with open(audio_file_path, 'rb') as audio_file:
-                await context.bot.send_audio(
-                    chat_id=update.effective_chat.id,
-                    audio=audio_file,
-                    caption=f"Audio from {url}"
-                )
+            await send_audio_file(update, context, audio_file_path, f"Audio from {url}")
         except Exception as e:
             logger.error(f"Failed to send audio: {e}")
             await update.message.reply_text(f"Failed to send audio: {e}")
@@ -710,10 +1161,14 @@ def main() -> None:
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("settings", settings_command))
+    application.add_handler(MessageHandler(filters.Regex(r'^/set-proxy(?:\s|$)'), set_proxy_command))
+    application.add_handler(MessageHandler(filters.Regex(r'^/set-cookies(?:\s|$)'), set_cookies_command))
+    application.add_handler(MessageHandler(filters.Regex(r'^/set-download-timeout(?:\s|$)'), set_download_timeout_command))
     application.add_handler(CommandHandler("set_proxy", set_proxy_command))
     application.add_handler(CommandHandler("set_cookies", set_cookies_command))
+    application.add_handler(CommandHandler("set_download_timeout", set_download_timeout_command))
     application.add_handler(CallbackQueryHandler(settings_button))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, download_video))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
 
     application.run_polling()
 

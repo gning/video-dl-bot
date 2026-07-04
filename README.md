@@ -48,8 +48,10 @@ python video_dl_bot.py
    - Audio Only: Download only audio, no video
    - Compress Video: Compress large videos for easier sharing
    - Split Large Files: Split videos exceeding Telegram's size limits
-   - Proxy: Set a proxy for downloads (with `/set_proxy` command)
+   - Proxy: Set a proxy for downloads (with `/set-proxy` command)
+   - Download Timeout: Limit each single video/audio download (with `/set-download-timeout` command, default 60 minutes)
 4. Send a video URL to the bot to download it
+   - For YouTube playlists, the bot asks for a start index and end index before downloading. If you do not reply within 30 seconds, it defaults to the first item and then the last item.
 
 ## Deployment
 
