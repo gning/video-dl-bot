@@ -16,7 +16,9 @@ load_dotenv()
 
 # Constants
 BOT_TOKEN = os.getenv('BOT_TOKEN')
+RCLONE_DESTINATION = os.getenv('RCLONE_DESTINATION', '').strip()
 MB_IN_BYTES = 1024 * 1024
+RCLONE_UPLOAD_THRESHOLD_BYTES = 2 * 1024 * 1024 * 1024
 UPLOAD_SIZE_LIMIT_MB = int(os.getenv('UPLOAD_SIZE_LIMIT_MB', 50))
 SPLIT_SIZE_LIMIT_MB = int(os.getenv('SPLIT_SIZE_LIMIT_MB', 40)) #If one or more splitted file are bigger than UPLOAD_SIZE_LIMIT_MB, decrease this value
 SUBDIR = "downloads"
@@ -713,12 +715,47 @@ async def compress_video(file_path: str) -> str:
         logger.error(f"Failed to compress video: {str(e)}")
         raise
 
+def upload_video_with_rclone(file_path: str) -> str:
+    """Upload a video to the configured rclone destination and return its remote path."""
+    if not RCLONE_DESTINATION:
+        raise RuntimeError("RCLONE_DESTINATION is not configured")
+
+    remote_path = f"{RCLONE_DESTINATION.rstrip('/')}/{os.path.basename(file_path)}"
+    try:
+        result = subprocess.run(
+            ['rclone', 'copyto', file_path, remote_path],
+            check=False,
+            text=True,
+            capture_output=True
+        )
+    except FileNotFoundError as e:
+        raise RuntimeError("rclone is not installed or is not available in PATH") from e
+
+    if result.returncode != 0:
+        error_output = (result.stderr or result.stdout).strip()
+        if len(error_output) > 1000:
+            error_output = error_output[-1000:]
+        raise RuntimeError(f"rclone upload failed: {error_output or 'unknown error'}")
+
+    logger.info(f"Video uploaded successfully with rclone: {os.path.basename(file_path)}")
+    return remote_path
+
 async def process_and_send_video(update: Update, context: CallbackContext, video_file_path: str, settings: dict) -> bool:
     """Process a single video file (compress/split if needed) and send it."""
     filename_base = os.path.splitext(os.path.basename(video_file_path))[0]
     video_size = os.path.getsize(video_file_path)
 
     try:
+        if video_size > RCLONE_UPLOAD_THRESHOLD_BYTES:
+            await update.message.reply_text(
+                f"Video {os.path.basename(video_file_path)} is larger than 2 GiB. Uploading to cloud storage..."
+            )
+            remote_path = await asyncio.to_thread(upload_video_with_rclone, video_file_path)
+            await update.message.reply_text(
+                f"Video uploaded to cloud storage successfully:\n{remote_path}"
+            )
+            return True
+
         if video_size / MB_IN_BYTES > UPLOAD_SIZE_LIMIT_MB:
             if settings['compress_video']:
                 await update.message.reply_text(f"Video {os.path.basename(video_file_path)} is too large. Compressing...")
