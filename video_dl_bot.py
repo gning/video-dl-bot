@@ -4,7 +4,9 @@ import logging
 import subprocess
 import shlex
 import asyncio
-from urllib.parse import urlparse, parse_qs
+import tempfile
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+from urllib.request import Request, ProxyHandler, build_opener
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import TimedOut
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackContext, CallbackQueryHandler
@@ -27,6 +29,13 @@ TELEGRAM_WRITE_TIMEOUT = 300.0
 TELEGRAM_READ_TIMEOUT = 300.0
 TELEGRAM_CONNECT_TIMEOUT = 30.0
 PLAYLIST_RANGE_REPLY_TIMEOUT = 30
+BILIBILI_USER_AGENT = 'curl/8.10.1'
+BILIBILI_MEDIA_USER_AGENT = (
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+    'AppleWebKit/537.36 (KHTML, like Gecko) '
+    'Chrome/138.0.0.0 Safari/537.36'
+)
+BILIBILI_SHORT_HOSTS = {'b23.tv'}
 
 # Default user settings
 DEFAULT_SETTINGS = {
@@ -458,7 +467,189 @@ def is_youtube_playlist_url(url: str) -> bool:
     """Check if URL is a YouTube playlist (not a single video with a list param)."""
     return 'youtube.com/playlist' in url.lower() and 'list=' in url.lower()
 
-async def refine_url_and_filename(url: str) -> tuple:
+def is_bilibili_url(url: str) -> bool:
+    """Check if URL points to Bilibili or its short-link service."""
+    hostname = (urlparse(url).hostname or '').lower()
+    return (
+        hostname in BILIBILI_SHORT_HOSTS
+        or hostname == 'bilibili.com'
+        or hostname.endswith('.bilibili.com')
+    )
+
+def is_bilibili_short_url(url: str) -> bool:
+    """Check if URL is a Bilibili short link."""
+    return (urlparse(url).hostname or '').lower() in BILIBILI_SHORT_HOSTS
+
+def build_http_opener(proxy_url: str = 'none'):
+    """Build an HTTP opener that honors the user's download proxy."""
+    if proxy_url == 'none':
+        return build_opener()
+    return build_opener(ProxyHandler({'http': proxy_url, 'https': proxy_url}))
+
+def resolve_bilibili_short_url(url: str, proxy_url: str = 'none') -> str:
+    """Resolve a Bilibili short link using a user agent accepted by its anti-bot layer."""
+    request = Request(url, headers={'User-Agent': BILIBILI_USER_AGENT})
+    with build_http_opener(proxy_url).open(request, timeout=15) as response:
+        return response.geturl()
+
+def clean_bilibili_video_url(url: str) -> str:
+    """Remove Bilibili share tracking while retaining the selected video part."""
+    parsed_url = urlparse(url)
+    if '/video/' not in parsed_url.path.lower():
+        return url
+
+    part = parse_qs(parsed_url.query).get('p', [''])[0]
+    query = urlencode({'p': part}) if part else ''
+    return urlunparse((
+        parsed_url.scheme,
+        parsed_url.netloc,
+        parsed_url.path,
+        '',
+        query,
+        ''
+    ))
+
+def is_bilibili_video_url(url: str) -> bool:
+    """Check if URL is an ordinary Bilibili video page supported by the API fallback."""
+    return is_bilibili_url(url) and '/video/' in urlparse(url).path.lower()
+
+def fetch_bilibili_api(path: str, query: dict, settings: dict) -> dict:
+    """Fetch data from a public Bilibili API endpoint."""
+    api_url = f"https://api.bilibili.com{path}?{urlencode(query)}"
+    request = Request(api_url, headers={
+        'User-Agent': BILIBILI_USER_AGENT,
+        'Referer': 'https://www.bilibili.com/',
+        'Origin': 'https://www.bilibili.com'
+    })
+    proxy_url = settings.get('proxy_url', 'none')
+    with build_http_opener(proxy_url).open(request, timeout=30) as response:
+        payload = json.load(response)
+
+    if payload.get('code') != 0 or not payload.get('data'):
+        raise RuntimeError(
+            f"Bilibili API error {payload.get('code')}: "
+            f"{payload.get('message') or 'empty response'}"
+        )
+    return payload['data']
+
+def create_bilibili_info_json(url: str, settings: dict) -> str:
+    """Create yt-dlp input using Bilibili's public non-WBI API endpoints."""
+    parsed_url = urlparse(url)
+    path_parts = parsed_url.path.strip('/').split('/')
+    video_index = next(
+        index for index, part in enumerate(path_parts)
+        if part.lower() == 'video'
+    )
+    video_id = path_parts[video_index + 1]
+    if video_id.lower().startswith('bv'):
+        video_query = {'bvid': video_id}
+    elif video_id.lower().startswith('av') and video_id[2:].isdigit():
+        video_query = {'aid': video_id[2:]}
+    else:
+        raise ValueError(f"Unsupported Bilibili video id: {video_id}")
+
+    metadata = fetch_bilibili_api('/x/web-interface/view', video_query, settings)
+    pages = metadata.get('pages') or [metadata]
+    part_value = parse_qs(parsed_url.query).get('p', ['1'])[0]
+    try:
+        part_number = int(part_value)
+        if part_number < 1:
+            raise ValueError
+        selected_page = pages[part_number - 1]
+    except (ValueError, IndexError):
+        raise ValueError(f"Bilibili video part does not exist: p={part_value}")
+
+    play_query = {
+        'bvid': metadata['bvid'],
+        'cid': selected_page['cid'],
+        'qn': 127,
+        'fnval': 4048,
+        'fourk': 1,
+        'try_look': 1
+    }
+    play_data = fetch_bilibili_api('/x/player/playurl', play_query, settings)
+    dash = play_data.get('dash') or {}
+    media_headers = {
+        'User-Agent': BILIBILI_MEDIA_USER_AGENT,
+        'Referer': url
+    }
+    formats = []
+
+    for media_type in ('video', 'audio'):
+        for index, media in enumerate(dash.get(media_type) or []):
+            media_url = media.get('baseUrl') or media.get('base_url')
+            if not media_url:
+                continue
+
+            is_video = media_type == 'video'
+            codec = media.get('codecs') or ('unknown' if is_video else 'mp4a.40.2')
+            try:
+                fps = float(media.get('frameRate') or media.get('frame_rate') or 0) or None
+            except ValueError:
+                fps = None
+
+            formats.append({
+                'format_id': f"{media.get('id', 'unknown')}-{codec.split('.')[0]}-{index}",
+                'url': media_url,
+                'ext': 'mp4' if is_video else 'm4a',
+                'protocol': 'https',
+                'vcodec': codec if is_video else 'none',
+                'acodec': 'none' if is_video else codec,
+                'width': media.get('width') or None,
+                'height': media.get('height') or None,
+                'fps': fps,
+                'tbr': media.get('bandwidth', 0) / 1000 or None,
+                'http_headers': media_headers
+            })
+
+    if not formats or not any(item['vcodec'] != 'none' for item in formats):
+        raise RuntimeError('Bilibili API returned no downloadable video formats')
+
+    info = {
+        'id': f"{metadata['bvid']}_p{part_number}",
+        'title': selected_page.get('part') or metadata.get('title') or metadata['bvid'],
+        'formats': formats,
+        'duration': selected_page.get('duration'),
+        'thumbnail': metadata.get('pic'),
+        'uploader': (metadata.get('owner') or {}).get('name'),
+        'webpage_url': url,
+        'original_url': url,
+        'extractor': 'BiliBili public API',
+        'extractor_key': 'BiliBiliPublicApi',
+        'http_headers': media_headers
+    }
+
+    with tempfile.NamedTemporaryFile(
+        mode='w',
+        suffix='.info.json',
+        dir=SUBDIR,
+        encoding='utf-8',
+        delete=False
+    ) as info_file:
+        json.dump(info, info_file)
+        return info_file.name
+
+async def refine_url_and_filename(url: str, settings: dict = None) -> tuple:
+    url = url.strip()
+
+    if is_bilibili_short_url(url):
+        proxy_url = (settings or {}).get('proxy_url', 'none')
+        try:
+            loop = asyncio.get_running_loop()
+            url = await loop.run_in_executor(
+                None,
+                resolve_bilibili_short_url,
+                url,
+                proxy_url
+            )
+        except Exception as e:
+            logger.warning(f"Could not resolve Bilibili short URL {url}: {e}")
+
+    if is_bilibili_url(url):
+        refined_url = clean_bilibili_video_url(url)
+        filename_base = urlparse(refined_url).path.rstrip('/').split('/')[-1]
+        return refined_url, filename_base
+
     refined_url = url.split('?')[0]
     filename_base = refined_url.rstrip('/').split('/')[-1]
     if url.startswith(("https://youtube.com/watch", "https://www.youtube.com/watch")):
@@ -591,7 +782,12 @@ def build_ytdlp_base_options(settings: dict, url: str = '') -> list:
 
     return options
 
-def build_video_command(url: str, output_path: str, settings: dict) -> list:
+def build_video_command(
+    url: str,
+    output_path: str,
+    settings: dict,
+    info_json_path: str = None
+) -> list:
     """Build yt-dlp command for video download with improved success rate."""
     cmd = ['yt-dlp']
     cmd.extend(build_ytdlp_base_options(settings, url))
@@ -649,10 +845,18 @@ def build_video_command(url: str, output_path: str, settings: dict) -> list:
             '-o', f'{output_path}.%(ext)s'
         ])
 
-    cmd.append(url)
+    if info_json_path:
+        cmd.extend(['--load-info-json', info_json_path])
+    else:
+        cmd.append(url)
     return cmd
 
-def build_audio_command(url: str, output_path: str, settings: dict) -> list:
+def build_audio_command(
+    url: str,
+    output_path: str,
+    settings: dict,
+    info_json_path: str = None
+) -> list:
     """Build yt-dlp command for audio-only download with improved success rate."""
     cmd = ['yt-dlp']
     cmd.extend(build_ytdlp_base_options(settings, url))
@@ -674,7 +878,10 @@ def build_audio_command(url: str, output_path: str, settings: dict) -> list:
             '-o', f'{output_path}.%(ext)s'
         ])
 
-    cmd.append(url)
+    if info_json_path:
+        cmd.extend(['--load-info-json', info_json_path])
+    else:
+        cmd.append(url)
     return cmd
 
 def run_ytdlp_command(cmd: list, timeout_seconds: int = 600) -> tuple:
@@ -967,7 +1174,7 @@ async def download_youtube_playlist_audio(update: Update, context: CallbackConte
 
 async def download_video(update: Update, context: CallbackContext) -> None:
     settings = get_user_settings(update.effective_user.id)
-    refined_url, filename_base = await refine_url_and_filename(update.message.text)
+    refined_url, filename_base = await refine_url_and_filename(update.message.text, settings)
     download_timeout_seconds = get_download_timeout_seconds(settings)
 
     # Create downloads directory if it doesn't exist
@@ -992,10 +1199,28 @@ async def download_video(update: Update, context: CallbackContext) -> None:
 
     # Build and run the improved yt-dlp command
     video_path = f'{SUBDIR}/{filename_base}'
-    cmd = build_video_command(refined_url, video_path, settings)
+    info_json_path = None
+    if (
+        is_bilibili_video_url(refined_url)
+        and settings.get('cookies_browser', 'none') == 'none'
+    ):
+        try:
+            info_json_path = create_bilibili_info_json(refined_url, settings)
+            logger.info(f"Using Bilibili public API extraction for {refined_url}")
+        except Exception as e:
+            logger.warning(f"Bilibili public API extraction failed, using yt-dlp extractor: {e}")
+
+    cmd = build_video_command(refined_url, video_path, settings, info_json_path)
     logger.info(f"Running yt-dlp command: {' '.join(cmd)}")
 
-    success, stdout, stderr = run_ytdlp_command(cmd, timeout_seconds=download_timeout_seconds)
+    try:
+        success, stdout, stderr = run_ytdlp_command(
+            cmd,
+            timeout_seconds=download_timeout_seconds
+        )
+    finally:
+        if info_json_path and os.path.exists(info_json_path):
+            os.remove(info_json_path)
 
     if not success:
         # Extract meaningful error message from stderr
@@ -1060,13 +1285,28 @@ async def download_video(update: Update, context: CallbackContext) -> None:
 async def download_audio_only(update: Update, context: CallbackContext, url: str, filename_base: str, settings: dict, timeout_seconds: int = None) -> None:
     """Download audio only version of the content"""
     audio_path = f'{SUBDIR}/{filename_base}'
-    cmd = build_audio_command(url, audio_path, settings)
+    info_json_path = None
+    if (
+        is_bilibili_video_url(url)
+        and settings.get('cookies_browser', 'none') == 'none'
+    ):
+        try:
+            info_json_path = create_bilibili_info_json(url, settings)
+            logger.info(f"Using Bilibili public API extraction for audio from {url}")
+        except Exception as e:
+            logger.warning(f"Bilibili public API audio extraction failed, using yt-dlp extractor: {e}")
+
+    cmd = build_audio_command(url, audio_path, settings, info_json_path)
     logger.info(f"Running yt-dlp audio command: {' '.join(cmd)}")
 
     if timeout_seconds is None:
         timeout_seconds = get_download_timeout_seconds(settings)
 
-    success, stdout, stderr = run_ytdlp_command(cmd, timeout_seconds=timeout_seconds)
+    try:
+        success, stdout, stderr = run_ytdlp_command(cmd, timeout_seconds=timeout_seconds)
+    finally:
+        if info_json_path and os.path.exists(info_json_path):
+            os.remove(info_json_path)
 
     if not success:
         error_msg = extract_error_message(stderr)
