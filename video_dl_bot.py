@@ -5,6 +5,7 @@ import subprocess
 import shlex
 import asyncio
 import tempfile
+import re
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 from urllib.request import Request, ProxyHandler, build_opener
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -36,6 +37,11 @@ BILIBILI_MEDIA_USER_AGENT = (
     'Chrome/138.0.0.0 Safari/537.36'
 )
 BILIBILI_SHORT_HOSTS = {'b23.tv'}
+SUBSTACK_USER_AGENT = (
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+    'AppleWebKit/537.36 (KHTML, like Gecko) '
+    'Chrome/138.0.0.0 Safari/537.36'
+)
 
 # Default user settings
 DEFAULT_SETTINGS = {
@@ -467,6 +473,18 @@ def is_youtube_playlist_url(url: str) -> bool:
     """Check if URL is a YouTube playlist (not a single video with a list param)."""
     return 'youtube.com/playlist' in url.lower() and 'list=' in url.lower()
 
+def is_substack_note_url(url: str) -> bool:
+    """Check if URL is a Substack Note."""
+    parsed_url = urlparse(url)
+    hostname = (parsed_url.hostname or '').lower()
+    path_parts = parsed_url.path.strip('/').split('/')
+    return (
+        (hostname == 'substack.com' or hostname.endswith('.substack.com'))
+        and len(path_parts) >= 2
+        and path_parts[-2].lower() == 'note'
+        and re.fullmatch(r'c-\d+', path_parts[-1].lower()) is not None
+    )
+
 def is_bilibili_url(url: str) -> bool:
     """Check if URL points to Bilibili or its short-link service."""
     hostname = (urlparse(url).hostname or '').lower()
@@ -485,6 +503,58 @@ def build_http_opener(proxy_url: str = 'none'):
     if proxy_url == 'none':
         return build_opener()
     return build_opener(ProxyHandler({'http': proxy_url, 'https': proxy_url}))
+
+def extract_substack_note_video_ids(webpage: str) -> list:
+    """Extract native video upload IDs from a Substack Note webpage."""
+    preload_match = re.search(
+        r'window\._preloads\s*=\s*JSON\.parse\(("(?:\\.|[^"\\])*")\)',
+        webpage,
+        re.DOTALL
+    )
+    if not preload_match:
+        raise RuntimeError('Could not find Substack Note metadata')
+
+    try:
+        preloads = json.loads(json.loads(preload_match.group(1)))
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f'Could not parse Substack Note metadata: {e}') from e
+
+    feed_item = (preloads.get('feedData') or {}).get('feedItem') or {}
+    note = feed_item.get('comment') or feed_item.get('post') or {}
+    video_ids = []
+    for attachment in note.get('attachments') or []:
+        media_upload = attachment.get('mediaUpload') or {}
+        if (
+            attachment.get('type') != 'video'
+            and media_upload.get('media_type') != 'video'
+        ):
+            continue
+
+        video_upload = attachment.get('videoUpload') or {}
+        upload_id = str(media_upload.get('id') or video_upload.get('id') or '')
+        if upload_id and upload_id not in video_ids:
+            video_ids.append(upload_id)
+
+    if not video_ids:
+        raise RuntimeError('This Substack Note contains no downloadable videos')
+    return video_ids
+
+def get_substack_note_media_urls(url: str, settings: dict) -> list:
+    """Resolve a Substack Note to stable video manifest endpoints."""
+    request = Request(url, headers={'User-Agent': SUBSTACK_USER_AGENT})
+    proxy_url = settings.get('proxy_url', 'none')
+    with build_http_opener(proxy_url).open(request, timeout=30) as response:
+        charset = response.headers.get_content_charset() or 'utf-8'
+        webpage = response.read().decode(charset, errors='replace')
+        resolved_url = response.geturl()
+
+    video_ids = extract_substack_note_video_ids(webpage)
+    parsed_url = urlparse(resolved_url)
+    origin = f'{parsed_url.scheme}://{parsed_url.netloc}'
+    return [
+        f'{origin}/api/v1/video/upload/{video_id}/src?type=hls'
+        for video_id in video_ids
+    ]
 
 def resolve_bilibili_short_url(url: str, proxy_url: str = 'none') -> str:
     """Resolve a Bilibili short link using a user agent accepted by its anti-bot layer."""
@@ -786,7 +856,8 @@ def build_video_command(
     url: str,
     output_path: str,
     settings: dict,
-    info_json_path: str = None
+    info_json_path: str = None,
+    media_urls: list = None
 ) -> list:
     """Build yt-dlp command for video download with improved success rate."""
     cmd = ['yt-dlp']
@@ -833,11 +904,16 @@ def build_video_command(
     cmd.extend(['-f', format_selection])
 
     # Output format and path
-    # For Twitter/X and YouTube playlists, use playlist index to handle multiple videos
+    # Use a unique output name when one input can produce multiple videos
     if is_twitter_url(url) or is_youtube_playlist_url(url):
         cmd.extend([
             '--merge-output-format', 'mp4',
             '-o', f'{output_path}_%(playlist_index|0)s.%(ext)s'
+        ])
+    elif media_urls and len(media_urls) > 1:
+        cmd.extend([
+            '--merge-output-format', 'mp4',
+            '-o', f'{output_path}_%(autonumber)03d.%(ext)s'
         ])
     else:
         cmd.extend([
@@ -847,6 +923,8 @@ def build_video_command(
 
     if info_json_path:
         cmd.extend(['--load-info-json', info_json_path])
+    elif media_urls:
+        cmd.extend(media_urls)
     else:
         cmd.append(url)
     return cmd
@@ -855,20 +933,28 @@ def build_audio_command(
     url: str,
     output_path: str,
     settings: dict,
-    info_json_path: str = None
+    info_json_path: str = None,
+    media_urls: list = None
 ) -> list:
     """Build yt-dlp command for audio-only download with improved success rate."""
     cmd = ['yt-dlp']
     cmd.extend(build_ytdlp_base_options(settings, url))
 
     # Audio extraction options
-    # For Twitter/X and YouTube playlists, use playlist index to handle multiple audio files
+    # Use a unique output name when one input can produce multiple audio files
     if is_twitter_url(url) or is_youtube_playlist_url(url):
         cmd.extend([
             '-x',
             '--audio-format', 'mp3',
             '--audio-quality', '0',  # Best quality
             '-o', f'{output_path}_%(playlist_index|0)s.%(ext)s'
+        ])
+    elif media_urls and len(media_urls) > 1:
+        cmd.extend([
+            '-x',
+            '--audio-format', 'mp3',
+            '--audio-quality', '0',
+            '-o', f'{output_path}_%(autonumber)03d.%(ext)s'
         ])
     else:
         cmd.extend([
@@ -880,9 +966,19 @@ def build_audio_command(
 
     if info_json_path:
         cmd.extend(['--load-info-json', info_json_path])
+    elif media_urls:
+        cmd.extend(media_urls)
     else:
         cmd.append(url)
     return cmd
+
+def format_command_for_log(cmd: list) -> str:
+    """Format a command without persisting proxy credentials."""
+    redacted = list(cmd)
+    for index, argument in enumerate(redacted[:-1]):
+        if argument == '--proxy':
+            redacted[index + 1] = '[REDACTED]'
+    return ' '.join(redacted)
 
 def run_ytdlp_command(cmd: list, timeout_seconds: int = 600) -> tuple:
     """Run yt-dlp command and return (success, stdout, stderr)."""
@@ -1034,7 +1130,7 @@ async def process_playlist_range(context: CallbackContext, request: dict, start_
             if mode == 'audio'
             else build_video_command(item_url, item_path, settings)
         )
-        logger.info(f"Running yt-dlp playlist {item_name} command: {' '.join(cmd)}")
+        logger.info(f"Running yt-dlp playlist {item_name} command: {format_command_for_log(cmd)}")
 
         success, stdout, stderr = run_ytdlp_command(cmd, timeout_seconds=download_timeout_seconds)
 
@@ -1181,6 +1277,22 @@ async def download_video(update: Update, context: CallbackContext) -> None:
     if not os.path.exists(SUBDIR):
         os.makedirs(SUBDIR)
 
+    substack_media_urls = None
+    if is_substack_note_url(refined_url):
+        try:
+            substack_media_urls = await asyncio.to_thread(
+                get_substack_note_media_urls,
+                refined_url,
+                settings
+            )
+            logger.info(
+                f"Found {len(substack_media_urls)} Substack video(s) for {refined_url}"
+            )
+        except Exception as e:
+            logger.error(f"Could not extract Substack Note videos from {refined_url}: {e}")
+            await update.message.reply_text(f"Could not extract Substack Note video:\n{e}")
+            return
+
     # If audio_only is enabled, only download audio
     if settings['audio_only']:
         if is_youtube_playlist_url(refined_url):
@@ -1188,7 +1300,14 @@ async def download_video(update: Update, context: CallbackContext) -> None:
             return
 
         await update.message.reply_text(f"Downloading audio only from: {refined_url}")
-        await download_audio_only(update, context, refined_url, filename_base, settings)
+        await download_audio_only(
+            update,
+            context,
+            refined_url,
+            filename_base,
+            settings,
+            media_urls=substack_media_urls
+        )
         return
 
     if is_youtube_playlist_url(refined_url):
@@ -1210,8 +1329,14 @@ async def download_video(update: Update, context: CallbackContext) -> None:
         except Exception as e:
             logger.warning(f"Bilibili public API extraction failed, using yt-dlp extractor: {e}")
 
-    cmd = build_video_command(refined_url, video_path, settings, info_json_path)
-    logger.info(f"Running yt-dlp command: {' '.join(cmd)}")
+    cmd = build_video_command(
+        refined_url,
+        video_path,
+        settings,
+        info_json_path,
+        substack_media_urls
+    )
+    logger.info(f"Running yt-dlp command: {format_command_for_log(cmd)}")
 
     try:
         success, stdout, stderr = run_ytdlp_command(
@@ -1223,16 +1348,29 @@ async def download_video(update: Update, context: CallbackContext) -> None:
             os.remove(info_json_path)
 
     if not success:
+        if substack_media_urls:
+            logger.error("Substack native video download failed")
+            await update.message.reply_text(
+                "Substack native video download failed. Please try again later."
+            )
+            return
         # Extract meaningful error message from stderr
         error_msg = extract_error_message(stderr)
         logger.error(f"Download failed: {stderr}")
         await update.message.reply_text(f"Download failed:\n{error_msg}")
         return
 
-    logger.info(f"Video downloaded successfully! Output:\n{stdout}")
+    if substack_media_urls:
+        logger.info("Substack native video downloaded successfully")
+    else:
+        logger.info(f"Video downloaded successfully! Output:\n{stdout}")
 
-    # For Twitter/X and YouTube playlists, handle multiple videos
-    if is_twitter_url(refined_url) or is_youtube_playlist_url(refined_url):
+    # Handle URLs that can produce multiple videos
+    if (
+        is_twitter_url(refined_url)
+        or is_youtube_playlist_url(refined_url)
+        or (substack_media_urls and len(substack_media_urls) > 1)
+    ):
         try:
             video_files = find_all_downloaded_files(filename_base)
         except FileNotFoundError as e:
@@ -1259,7 +1397,14 @@ async def download_video(update: Update, context: CallbackContext) -> None:
 
         # Download audio if enabled
         if settings['download_audio'] and not settings['audio_only']:
-            await download_audio_only(update, context, refined_url, filename_base + "_audio", settings)
+            await download_audio_only(
+                update,
+                context,
+                refined_url,
+                filename_base + "_audio",
+                settings,
+                media_urls=substack_media_urls
+            )
     else:
         # Single video handling for non-Twitter URLs
         try:
@@ -1276,13 +1421,28 @@ async def download_video(update: Update, context: CallbackContext) -> None:
 
         # Download audio if enabled
         if settings['download_audio'] and not settings['audio_only']:
-            await download_audio_only(update, context, refined_url, filename_base + "_audio", settings)
+            await download_audio_only(
+                update,
+                context,
+                refined_url,
+                filename_base + "_audio",
+                settings,
+                media_urls=substack_media_urls
+            )
 
         # Clean up video file
         if os.path.exists(video_file_path):
             os.remove(video_file_path)
 
-async def download_audio_only(update: Update, context: CallbackContext, url: str, filename_base: str, settings: dict, timeout_seconds: int = None) -> None:
+async def download_audio_only(
+    update: Update,
+    context: CallbackContext,
+    url: str,
+    filename_base: str,
+    settings: dict,
+    timeout_seconds: int = None,
+    media_urls: list = None
+) -> None:
     """Download audio only version of the content"""
     audio_path = f'{SUBDIR}/{filename_base}'
     info_json_path = None
@@ -1296,8 +1456,8 @@ async def download_audio_only(update: Update, context: CallbackContext, url: str
         except Exception as e:
             logger.warning(f"Bilibili public API audio extraction failed, using yt-dlp extractor: {e}")
 
-    cmd = build_audio_command(url, audio_path, settings, info_json_path)
-    logger.info(f"Running yt-dlp audio command: {' '.join(cmd)}")
+    cmd = build_audio_command(url, audio_path, settings, info_json_path, media_urls)
+    logger.info(f"Running yt-dlp audio command: {format_command_for_log(cmd)}")
 
     if timeout_seconds is None:
         timeout_seconds = get_download_timeout_seconds(settings)
@@ -1309,13 +1469,23 @@ async def download_audio_only(update: Update, context: CallbackContext, url: str
             os.remove(info_json_path)
 
     if not success:
+        if media_urls:
+            logger.error("Substack native audio download failed")
+            await update.message.reply_text(
+                "Substack native audio download failed. Please try again later."
+            )
+            return
         error_msg = extract_error_message(stderr)
         logger.error(f"Audio download failed: {stderr}")
         await update.message.reply_text(f"Audio download failed:\n{error_msg}")
         return
 
-    # For Twitter/X and YouTube playlists, handle multiple audio files
-    if is_twitter_url(url) or is_youtube_playlist_url(url):
+    # Handle URLs that can produce multiple audio files
+    if (
+        is_twitter_url(url)
+        or is_youtube_playlist_url(url)
+        or (media_urls and len(media_urls) > 1)
+    ):
         try:
             audio_files = find_all_downloaded_files(filename_base)
         except FileNotFoundError as e:

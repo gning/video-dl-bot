@@ -5,6 +5,7 @@ A Telegram Bot that can download videos from Twitter, YouTube, etc. The download
 ## Features
 
 - Download videos from various platforms using yt-dlp
+- Download one or multiple native videos attached to a Substack Note
 - Download audio-only version of videos
 - Compress videos for easier sharing
 - Split large files into smaller chunks for Telegram's file size limits
