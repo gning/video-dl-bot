@@ -2,10 +2,12 @@ import os
 import math
 import logging
 import subprocess
+import sys
 import shlex
 import asyncio
 import tempfile
 import re
+from pathlib import Path
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 from urllib.request import Request, ProxyHandler, build_opener
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -19,6 +21,7 @@ load_dotenv()
 
 # Constants
 BOT_TOKEN = os.getenv('BOT_TOKEN')
+LOCAL_BOT_API_BASE = os.getenv('LOCAL_BOT_API_BASE', 'http://127.0.0.1:8081').rstrip('/')
 RCLONE_DESTINATION = os.getenv('RCLONE_DESTINATION', '').strip()
 MB_IN_BYTES = 1024 * 1024
 RCLONE_UPLOAD_THRESHOLD_BYTES = 2 * 1024 * 1024 * 1024
@@ -26,8 +29,10 @@ UPLOAD_SIZE_LIMIT_MB = int(os.getenv('UPLOAD_SIZE_LIMIT_MB', 50))
 SPLIT_SIZE_LIMIT_MB = int(os.getenv('SPLIT_SIZE_LIMIT_MB', 40)) #If one or more splitted file are bigger than UPLOAD_SIZE_LIMIT_MB, decrease this value
 SUBDIR = "downloads"
 SETTINGS_FILE = "user_settings.json"
-TELEGRAM_WRITE_TIMEOUT = 300.0
-TELEGRAM_READ_TIMEOUT = 300.0
+# The local API responds after relaying the file to Telegram, which can take
+# several minutes for large videos even when the request only contains a path.
+TELEGRAM_WRITE_TIMEOUT = 1800.0
+TELEGRAM_READ_TIMEOUT = 1800.0
 TELEGRAM_CONNECT_TIMEOUT = 30.0
 PLAYLIST_RANGE_REPLY_TIMEOUT = 30
 BILIBILI_USER_AGENT = 'curl/8.10.1'
@@ -777,7 +782,7 @@ def build_playlist_entry_url(entry: dict, playlist_id: str = '', index: int = No
 
 def get_youtube_playlist_entries(url: str, settings: dict, timeout_seconds: int) -> tuple:
     """Fetch a flat list of YouTube playlist entries."""
-    cmd = ['yt-dlp']
+    cmd = [sys.executable, '-m', 'yt_dlp']
     cmd.extend(build_ytdlp_base_options(settings, url))
     cmd.extend(['--flat-playlist', '--dump-single-json', url])
 
@@ -860,7 +865,7 @@ def build_video_command(
     media_urls: list = None
 ) -> list:
     """Build yt-dlp command for video download with improved success rate."""
-    cmd = ['yt-dlp']
+    cmd = [sys.executable, '-m', 'yt_dlp']
     cmd.extend(build_ytdlp_base_options(settings, url))
 
     # Check preferred audio language
@@ -937,7 +942,7 @@ def build_audio_command(
     media_urls: list = None
 ) -> list:
     """Build yt-dlp command for audio-only download with improved success rate."""
-    cmd = ['yt-dlp']
+    cmd = [sys.executable, '-m', 'yt_dlp']
     cmd.extend(build_ytdlp_base_options(settings, url))
 
     # Audio extraction options
@@ -1223,15 +1228,14 @@ async def download_youtube_playlist(update: Update, context: CallbackContext, ur
 async def send_audio_file(update: Update, context: CallbackContext, audio_file_path: str, caption: str) -> bool:
     """Send a single audio file with the provided caption."""
     try:
-        with open(audio_file_path, 'rb') as audio_file:
-            await context.bot.send_audio(
-                chat_id=update.effective_chat.id,
-                audio=audio_file,
-                caption=caption,
-                write_timeout=TELEGRAM_WRITE_TIMEOUT,
-                read_timeout=TELEGRAM_READ_TIMEOUT,
-                connect_timeout=TELEGRAM_CONNECT_TIMEOUT
-            )
+        await context.bot.send_audio(
+            chat_id=update.effective_chat.id,
+            audio=Path(audio_file_path).resolve(strict=True),
+            caption=caption,
+            write_timeout=TELEGRAM_WRITE_TIMEOUT,
+            read_timeout=TELEGRAM_READ_TIMEOUT,
+            connect_timeout=TELEGRAM_CONNECT_TIMEOUT
+        )
         return True
     except TimedOut as e:
         logger.warning(f"Telegram timed out while sending audio file {audio_file_path}: {e}")
@@ -1564,15 +1568,16 @@ async def split_and_send_video(update: Update, context: CallbackContext, full_fi
 
 async def send_video(update: Update, context: CallbackContext, file_path: str) -> None:
     try:
-        with open(file_path, 'rb') as video_file:
-            await context.bot.send_document(
-                chat_id=update.effective_chat.id,
-                document=video_file,
-                filename=os.path.basename(file_path),
-                write_timeout=60.0,
-                read_timeout=60.0,
-                connect_timeout=30.0
-            )
+        # In local mode the API server reads this file directly from disk.
+        # Passing an open handle would buffer and upload the entire file.
+        await context.bot.send_document(
+            chat_id=update.effective_chat.id,
+            document=Path(file_path).resolve(strict=True),
+            filename=os.path.basename(file_path),
+            write_timeout=TELEGRAM_WRITE_TIMEOUT,
+            read_timeout=TELEGRAM_READ_TIMEOUT,
+            connect_timeout=TELEGRAM_CONNECT_TIMEOUT
+        )
     except Exception as e:
         error_message = str(e)
         logger.error(f"Failed to send video file {file_path}: {error_message}")
@@ -1603,7 +1608,9 @@ def main() -> None:
     load_settings()
     application = Application.builder()\
         .token(BOT_TOKEN)\
-        .base_url("http://127.0.0.1:8081/bot")\
+        .base_url(f"{LOCAL_BOT_API_BASE}/bot")\
+        .base_file_url(f"{LOCAL_BOT_API_BASE}/file/bot")\
+        .local_mode(True)\
         .build()
 
     application.add_handler(CommandHandler("start", start))
