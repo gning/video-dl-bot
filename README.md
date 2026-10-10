@@ -31,6 +31,7 @@ pip install -r requirements.txt
 
 ```
 BOT_TOKEN=your_telegram_bot_token
+LOCAL_BOT_API_BASE=http://127.0.0.1:8081
 UPLOAD_SIZE_LIMIT_MB=50
 SPLIT_SIZE_LIMIT_MB=40
 ```
@@ -57,6 +58,15 @@ python video_dl_bot.py
 ## Deployment
 
 The bot can be deployed on any server with Python and the required dependencies installed.
+
+Run a local Telegram Bot API server with `--local`, on the same host and with
+read access to the bot's downloads directory. Set `LOCAL_BOT_API_BASE` if its
+address differs from `http://127.0.0.1:8081`.
+
+Video and audio uploads pass absolute file paths to that server, avoiding large
+in-memory copies and HTTP uploads between the bot and the local server. Requests
+allow up to 30 minutes for the server to relay each file to Telegram.
+Keep the downloaded file on disk until the upload completes.
 
 ## License
 
