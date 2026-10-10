@@ -92,6 +92,17 @@ def save_settings():
     except Exception as e:
         logger.error(f"Error saving settings: {e}")
 
+def redact_proxy_url(proxy_url) -> str:
+    """Hide credentials (and path/query) of a proxy URL for display."""
+    if not proxy_url or proxy_url == 'none':
+        return 'none'
+    parsed = urlparse(proxy_url)
+    if not parsed.hostname:
+        return '[configured]'
+    port = f":{parsed.port}" if parsed.port else ''
+    userinfo = '***@' if (parsed.username or parsed.password) else ''
+    return f"{parsed.scheme}://{userinfo}{parsed.hostname}{port}"
+
 def get_user_settings(user_id: int) -> dict:
     """Get settings for a specific user"""
     if str(user_id) not in user_settings:
@@ -150,7 +161,7 @@ async def get_settings_keyboard(user_id: int) -> list:
             callback_data='toggle_ipv4'
         )],
         [InlineKeyboardButton(
-            f"🌐 Proxy: {settings['proxy_url']}",
+            f"🌐 Proxy: {redact_proxy_url(settings['proxy_url'])}",
             callback_data='show_proxy_info'
         )],
         [InlineKeyboardButton(
@@ -204,7 +215,7 @@ async def settings_button(update: Update, context: CallbackContext) -> None:
         settings['force_ipv4'] = not settings['force_ipv4']
     elif query.data == 'show_proxy_info':
         await query.answer(
-            f"Current proxy: {settings['proxy_url']}\n"
+            f"Current proxy: {redact_proxy_url(settings['proxy_url'])}\n"
             "Use /set-proxy URL to change",
             show_alert=True
         )
@@ -381,11 +392,20 @@ async def handle_playlist_range_reply(update: Update, context: CallbackContext) 
         )
         return True
 
+chat_locks = {}
+
+def get_chat_lock(chat_id) -> asyncio.Lock:
+    """One lock per chat: chats run concurrently, a chat's jobs run in order."""
+    if chat_id not in chat_locks:
+        chat_locks[chat_id] = asyncio.Lock()
+    return chat_locks[chat_id]
+
 async def handle_text_message(update: Update, context: CallbackContext) -> None:
     """Route text messages to pending prompts or the URL downloader."""
-    if await handle_playlist_range_reply(update, context):
-        return
-    await download_video(update, context)
+    async with get_chat_lock(update.effective_chat.id):
+        if await handle_playlist_range_reply(update, context):
+            return
+        await download_video(update, context)
 
 async def set_proxy_command(update: Update, context: CallbackContext) -> None:
     """Handle the proxy URL setting command"""
@@ -406,7 +426,7 @@ async def set_proxy_command(update: Update, context: CallbackContext) -> None:
         await update.message.reply_text("Proxy disabled.")
     else:
         settings['proxy_url'] = proxy_url
-        await update.message.reply_text(f"Proxy set to: {proxy_url}")
+        await update.message.reply_text(f"Proxy set to: {redact_proxy_url(proxy_url)}")
 
     save_settings()
 
@@ -780,13 +800,13 @@ def build_playlist_entry_url(entry: dict, playlist_id: str = '', index: int = No
         return f"https://www.youtube.com/watch?v={entry['url']}"
     return ''
 
-def get_youtube_playlist_entries(url: str, settings: dict, timeout_seconds: int) -> tuple:
+async def get_youtube_playlist_entries(url: str, settings: dict, timeout_seconds: int) -> tuple:
     """Fetch a flat list of YouTube playlist entries."""
     cmd = [sys.executable, '-m', 'yt_dlp']
     cmd.extend(build_ytdlp_base_options(settings, url))
     cmd.extend(['--flat-playlist', '--dump-single-json', url])
 
-    success, stdout, stderr = run_ytdlp_command(cmd, timeout_seconds=timeout_seconds)
+    success, stdout, stderr = await run_ytdlp_command(cmd, timeout_seconds=timeout_seconds)
     if not success:
         return False, [], stderr
 
@@ -985,26 +1005,53 @@ def format_command_for_log(cmd: list) -> str:
             redacted[index + 1] = '[REDACTED]'
     return ' '.join(redacted)
 
-def run_ytdlp_command(cmd: list, timeout_seconds: int = 600) -> tuple:
-    """Run yt-dlp command and return (success, stdout, stderr)."""
+async def run_ytdlp_command(cmd: list, timeout_seconds: int = 600) -> tuple:
+    """Run yt-dlp without blocking the event loop; return (success, stdout, stderr).
+
+    Progress output (commands using --newline) is streamed to the log line by
+    line. The process is killed if it exceeds timeout_seconds.
+    """
+    stream = '--newline' in cmd
+    stdout_lines, stderr_chunks = [], []
+
+    async def read_stdout(pipe):
+        async for raw in pipe:
+            line = raw.decode(errors='replace')
+            stdout_lines.append(line)
+            if stream and line.strip():
+                logger.info(f"yt-dlp: {line.rstrip()}")
+
+    async def read_stderr(pipe):
+        stderr_chunks.append((await pipe.read()).decode(errors='replace'))
+
     try:
-        result = subprocess.run(
-            cmd,
-            check=False,  # Don't raise exception, we'll check returncode
-            text=True,
-            capture_output=True,
-            timeout=timeout_seconds
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            limit=64 * 1024 * 1024,  # playlist JSON is emitted as one long line
         )
-
-        # yt-dlp returns 0 on success, non-zero on failure
-        success = result.returncode == 0
-
-        return success, result.stdout, result.stderr
-    except subprocess.TimeoutExpired:
-        timeout_minutes = max(1, math.ceil(timeout_seconds / 60))
-        return False, '', f'Download timed out after {timeout_minutes} minutes'
     except Exception as e:
         return False, '', str(e)
+
+    try:
+        await asyncio.wait_for(
+            asyncio.gather(read_stdout(proc.stdout), read_stderr(proc.stderr), proc.wait()),
+            timeout=timeout_seconds,
+        )
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        timeout_minutes = max(1, math.ceil(timeout_seconds / 60))
+        return False, ''.join(stdout_lines), f'Download timed out after {timeout_minutes} minutes'
+    except asyncio.CancelledError:
+        proc.kill()
+        raise
+    except Exception as e:
+        proc.kill()
+        return False, ''.join(stdout_lines), str(e)
+
+    return proc.returncode == 0, ''.join(stdout_lines), ''.join(stderr_chunks)
 
 def get_download_timeout_seconds(settings: dict) -> int:
     """Return the per-item download timeout in seconds."""
@@ -1016,7 +1063,7 @@ async def compress_video(file_path: str) -> str:
     command = f"ffmpeg -i {shlex.quote(file_path)} -c:v libx264 -tag:v avc1 -movflags faststart -crf 30 -preset superfast {shlex.quote(compressed_path)}"
     
     try:
-        subprocess.run(command, shell=True, check=True, text=True, capture_output=True)
+        await asyncio.to_thread(subprocess.run, command, shell=True, check=True, text=True, capture_output=True)
         logger.info(f"Video compressed successfully to {compressed_path}")
         return compressed_path
     except Exception as e:
@@ -1137,7 +1184,7 @@ async def process_playlist_range(context: CallbackContext, request: dict, start_
         )
         logger.info(f"Running yt-dlp playlist {item_name} command: {format_command_for_log(cmd)}")
 
-        success, stdout, stderr = run_ytdlp_command(cmd, timeout_seconds=download_timeout_seconds)
+        success, stdout, stderr = await run_ytdlp_command(cmd, timeout_seconds=download_timeout_seconds)
 
         if not success:
             failed_count += 1
@@ -1204,7 +1251,7 @@ async def download_youtube_playlist(update: Update, context: CallbackContext, ur
 
     await update.message.reply_text(f"Fetching playlist videos from: {url}")
 
-    success, entries, stderr = get_youtube_playlist_entries(url, settings, download_timeout_seconds)
+    success, entries, stderr = await get_youtube_playlist_entries(url, settings, download_timeout_seconds)
     if not success:
         error_msg = extract_error_message(stderr)
         logger.error(f"Failed to fetch playlist entries: {stderr}")
@@ -1251,7 +1298,7 @@ async def download_youtube_playlist_audio(update: Update, context: CallbackConte
 
     await update.message.reply_text(f"Fetching playlist audios from: {url}")
 
-    success, entries, stderr = get_youtube_playlist_entries(url, settings, download_timeout_seconds)
+    success, entries, stderr = await get_youtube_playlist_entries(url, settings, download_timeout_seconds)
     if not success:
         error_msg = extract_error_message(stderr)
         logger.error(f"Failed to fetch playlist entries for audio: {stderr}")
@@ -1343,7 +1390,7 @@ async def download_video(update: Update, context: CallbackContext) -> None:
     logger.info(f"Running yt-dlp command: {format_command_for_log(cmd)}")
 
     try:
-        success, stdout, stderr = run_ytdlp_command(
+        success, stdout, stderr = await run_ytdlp_command(
             cmd,
             timeout_seconds=download_timeout_seconds
         )
@@ -1467,7 +1514,7 @@ async def download_audio_only(
         timeout_seconds = get_download_timeout_seconds(settings)
 
     try:
-        success, stdout, stderr = run_ytdlp_command(cmd, timeout_seconds=timeout_seconds)
+        success, stdout, stderr = await run_ytdlp_command(cmd, timeout_seconds=timeout_seconds)
     finally:
         if info_json_path and os.path.exists(info_json_path):
             os.remove(info_json_path)
@@ -1531,14 +1578,14 @@ async def split_and_send_video(update: Update, context: CallbackContext, full_fi
 
     file_size = os.path.getsize(full_file_path)
     num_parts = math.ceil(file_size / (SPLIT_SIZE_LIMIT_MB * MB_IN_BYTES))
-    duration = float(subprocess.check_output(f"ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 {shlex.quote(full_file_path)}", shell=True).decode().strip())
+    duration = float((await asyncio.to_thread(subprocess.check_output, f"ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 {shlex.quote(full_file_path)}", shell=True)).decode().strip())
     segment_duration = duration / num_parts
 
     # Get the original file extension
     _, file_extension = os.path.splitext(full_file_path)
 
     split_command = f"ffmpeg -i {shlex.quote(full_file_path)} -c copy -map 0 -segment_time {segment_duration} -f segment -reset_timestamps 1 {SUBDIR}/{filename_base}_%03d{file_extension}"
-    subprocess.run(split_command, shell=True, check=True)
+    await asyncio.to_thread(subprocess.run, split_command, shell=True, check=True)
 
     success_count = 0
     failed_parts = []
@@ -1611,6 +1658,9 @@ def main() -> None:
         .base_url(f"{LOCAL_BOT_API_BASE}/bot")\
         .base_file_url(f"{LOCAL_BOT_API_BASE}/file/bot")\
         .local_mode(True)\
+        .get_updates_read_timeout(40)\
+        .get_updates_connect_timeout(10)\
+        .concurrent_updates(True)\
         .build()
 
     application.add_handler(CommandHandler("start", start))
@@ -1624,7 +1674,7 @@ def main() -> None:
     application.add_handler(CallbackQueryHandler(settings_button))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
 
-    application.run_polling()
+    application.run_polling(timeout=30)
 
 if __name__ == '__main__':
     main()

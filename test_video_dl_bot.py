@@ -93,7 +93,7 @@ class LocalUploadTests(unittest.IsolatedAsyncioTestCase):
         self.request.post.assert_not_awaited()
 
     async def test_startup_enables_local_paths_on_configured_api_server(self):
-        builder = Application.builder().request(self.request).get_updates_request(self.request)
+        builder = Application.builder()
         with patch.object(video_dl_bot.Application, 'builder', return_value=builder), \
              patch.object(video_dl_bot.Application, 'run_polling', autospec=True) as poll, \
              patch.object(video_dl_bot, 'BOT_TOKEN', '123456:local-upload-test'), \
